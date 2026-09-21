@@ -1,0 +1,123 @@
+name: egressa-ci
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.4"
+  COVERAGE_PACKAGES: "./pkg/... ./internal/..."
+  COVERAGE_THRESHOLD: "90"
+
+jobs:
+  quality:
+    name: Code quality checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Lint (golangci-lint)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  tests:
+    name: Test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run tests (race detector on) with coverage
+        run: |
+          go test -race -count=1 \
+            -coverprofile=coverage.out -covermode=atomic \
+            ${{ env.COVERAGE_PACKAGES }}
+
+      - name: Enforce coverage threshold
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          COVERAGE=$(go tool cover -func=coverage.out | grep '^total:' | awk '{print $NF}' | tr -d '%')
+          echo "Total coverage on ${{ env.COVERAGE_PACKAGES }}: ${COVERAGE}%"
+          awk -v cov="$COVERAGE" -v th="${{ env.COVERAGE_THRESHOLD }}" \
+            'BEGIN { if (cov + 0 < th + 0) { print "::error::coverage " cov "% is below the " th "% threshold"; exit 1 } }'
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+          if-no-files-found: error
+
+  build:
+    name: Build binaries
+    needs:
+      - quality
+      - tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build all cmd/ binaries
+        run: make build
+
+      - name: Cross-compile sanity check
+        run: |
+          GOOS=linux   GOARCH=amd64 go build ./...
+          GOOS=darwin  GOARCH=arm64 go build ./...
+          GOOS=windows GOARCH=amd64 go build ./...
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: egressa-binaries
+          path: bin/
+          if-no-files-found: error

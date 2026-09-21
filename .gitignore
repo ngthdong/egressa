@@ -1,0 +1,10 @@
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Local editor / OS noise
+.DS_Store
+.vscode/
+.idea/  

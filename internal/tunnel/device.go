@@ -11,6 +11,8 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
+
+	"github.com/ngthdong/egressa/pkg/wire"
 )
 
 // DefaultMTU matches WireGuard's own default tunnel MTU.
@@ -27,6 +29,15 @@ type Config struct {
 	Addresses []netip.Addr
 	// MTU is the tunnel MTU. Zero means DefaultMTU.
 	MTU int
+	// SessionID and Epoch are stamped into every outbound packet's
+	// session header. Zero values are valid; session management proper
+	// (assigning real IDs, bumping epoch on migration) comes later.
+	SessionID uint64
+	Epoch     uint32
+	// OnSessionPacket, if set, is called with every inbound packet's
+	// decoded session header, before the packet is delivered locally.
+	// Optional; used for observability and tests.
+	OnSessionPacket func(wire.SessionHeader)
 }
 
 // Device wraps a wireguard-go device backed by a userspace (netstack) TUN.
@@ -50,9 +61,10 @@ func New(cfg Config) (*Device, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tunnel: create TUN: %w", err)
 	}
+	bind := newSessionBind(conn.NewDefaultBind(), cfg.SessionID, cfg.Epoch, cfg.OnSessionPacket)
 
 	logger := device.NewLogger(device.LogLevelSilent, "")
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), logger)
+	dev := device.NewDevice(tun, bind, logger)
 
 	uapi := fmt.Sprintf("private_key=%s\nlisten_port=%d\n", Hex(cfg.PrivateKey), cfg.ListenPort)
 	if err := dev.IpcSet(uapi); err != nil {

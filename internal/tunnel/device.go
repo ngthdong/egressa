@@ -173,3 +173,41 @@ func (d *Device) LastHandshake(publicKey [KeySize]byte) (time.Time, error) {
 	}
 	return time.Unix(sec, 0), nil
 }
+
+// PeerStats returns the number of bytes sent to and received from the
+// peer identified by publicKey, as counted by WireGuard at the encrypted
+// transport layer. Both are 0 before any traffic has been exchanged.
+func (d *Device) PeerStats(publicKey [KeySize]byte) (tx, rx uint64, err error) {
+	cfg, err := d.uapiConfig()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	want := Hex(publicKey)
+	var inPeer bool
+	for _, line := range strings.Split(cfg, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "public_key":
+			inPeer = value == want
+		case "tx_bytes":
+			if inPeer {
+				tx, err = strconv.ParseUint(value, 10, 64)
+				if err != nil {
+					return 0, 0, fmt.Errorf("tunnel: parse tx_bytes: %w", err)
+				}
+			}
+		case "rx_bytes":
+			if inPeer {
+				rx, err = strconv.ParseUint(value, 10, 64)
+				if err != nil {
+					return 0, 0, fmt.Errorf("tunnel: parse rx_bytes: %w", err)
+				}
+			}
+		}
+	}
+	return tx, rx, nil
+}

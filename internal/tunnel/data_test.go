@@ -22,7 +22,7 @@ func TestSendPacket_TCPEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenTCP: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	const message = "hello through the tunnel"
 	serverDone := make(chan error, 1)
@@ -32,7 +32,7 @@ func TestSendPacket_TCPEcho(t *testing.T) {
 			serverDone <- fmt.Errorf("Accept: %w", err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		buf := make([]byte, len(message))
 		if _, err := io.ReadFull(conn, buf); err != nil {
@@ -53,7 +53,7 @@ func TestSendPacket_TCPEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialContext: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte(message)); err != nil {
 		t.Fatalf("Write: %v", err)

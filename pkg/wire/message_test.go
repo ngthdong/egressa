@@ -58,6 +58,13 @@ func TestEnvelope_WrongTypeAccessor(t *testing.T) {
 	}
 }
 
+func TestEnvelope_AsMigratePrepare_MalformedPayload(t *testing.T) {
+	e := Envelope{Type: MsgMigratePrepare, Payload: []byte(`{not json`)}
+	if _, err := e.AsMigratePrepare(); err == nil {
+		t.Fatal("AsMigratePrepare with malformed payload: expected error, got nil")
+	}
+}
+
 func TestDecodeEnvelope_MissingType(t *testing.T) {
 	if _, err := DecodeEnvelope([]byte(`{"session_id": 1}`)); err == nil {
 		t.Fatal("DecodeEnvelope with missing type: expected error, got nil")

@@ -96,6 +96,35 @@ func TestNew_NetAccessor(t *testing.T) {
 	}
 }
 
+// TestNew_ListenPortInUse checks that New surfaces a bind error when the
+// requested port is already held by another device, rather than silently
+// picking a different one.
+func TestNew_ListenPortInUse(t *testing.T) {
+	kp, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+
+	first, err := New(Config{
+		PrivateKey: kp.Private,
+		ListenPort: 51901,
+		Addresses:  []netip.Addr{testAddr(t)},
+	})
+	if err != nil {
+		t.Fatalf("New (first): %v", err)
+	}
+	defer first.Close()
+
+	_, err = New(Config{
+		PrivateKey: kp.Private,
+		ListenPort: 51901,
+		Addresses:  []netip.Addr{testAddr(t)},
+	})
+	if err == nil {
+		t.Fatal("New with an already-bound port: expected error, got nil")
+	}
+}
+
 func TestNew_ExplicitListenPort(t *testing.T) {
 	kp, err := GenerateKeyPair()
 	if err != nil {

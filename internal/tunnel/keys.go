@@ -23,8 +23,20 @@ func GenerateKeyPair() (KeyPair, error) {
 
 	var kp KeyPair
 	copy(kp.Private[:], priv.Bytes())
+	clamp(&kp.Private)
 	copy(kp.Public[:], priv.PublicKey().Bytes())
 	return kp, nil
+}
+
+// clamp applies the RFC 7748 X25519 clamping bits to a private key in
+// place. X25519 scalar multiplication clamps its input internally
+// regardless, so this does not change which key pair k represents. It
+// just makes the stored bytes match the canonical form every X25519
+// implementation (including wireguard-go) reports back.
+func clamp(k *[KeySize]byte) {
+	k[0] &= 248
+	k[31] &= 127
+	k[31] |= 64
 }
 
 func Hex(key [KeySize]byte) string {

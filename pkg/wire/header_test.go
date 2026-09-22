@@ -101,6 +101,23 @@ func TestSessionHeader_WireLayout(t *testing.T) {
 	}
 }
 
+func TestPacketType_String(t *testing.T) {
+	cases := []struct {
+		in   PacketType
+		want string
+	}{
+		{PacketTypeData, "DATA"},
+		{PacketTypeProbe, "PROBE"},
+		{PacketTypeKeepalive, "KEEPALIVE"},
+		{PacketType(99), "UNKNOWN(99)"},
+	}
+	for _, tc := range cases {
+		if got := tc.in.String(); got != tc.want {
+			t.Errorf("PacketType(%d).String() = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestDecode_ShortBuffer(t *testing.T) {
 	for _, n := range []int{0, 1, 8, SessionHeaderSize - 1} {
 		buf := make([]byte, n)

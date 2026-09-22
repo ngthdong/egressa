@@ -1,0 +1,84 @@
+package tunnel
+
+import (
+	"bytes"
+	"fmt"
+	"net/netip"
+
+	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun/netstack"
+)
+
+// DefaultMTU matches WireGuard's own default tunnel MTU.
+const DefaultMTU = 1420
+
+// Config configures a Device.
+type Config struct {
+	// PrivateKey is this device's own private key.
+	PrivateKey [KeySize]byte
+	// ListenPort is the UDP port this device listens on. 0 picks a free
+	// port, which is what tests should use.
+	ListenPort uint16
+	// Addresses are the virtual IPs this device answers to on the tunnel.
+	Addresses []netip.Addr
+	// MTU is the tunnel MTU. Zero means DefaultMTU.
+	MTU int
+}
+
+// Device wraps a wireguard-go device backed by a userspace (netstack) TUN.
+// This needs no OS-level TUN device and no elevated privileges, so it can
+// be created and torn down freely in tests.
+//
+// A real OS-level TUN device (which does need root) is a separate concern,
+// added later when the gateway needs to route real system traffic.
+type Device struct {
+	dev *device.Device
+	net *netstack.Net
+}
+
+func New(cfg Config) (*Device, error) {
+	mtu := cfg.MTU
+	if mtu == 0 {
+		mtu = DefaultMTU
+	}
+
+	tun, tnet, err := netstack.CreateNetTUN(cfg.Addresses, nil, mtu)
+	if err != nil {
+		return nil, fmt.Errorf("tunnel: create TUN: %w", err)
+	}
+
+	logger := device.NewLogger(device.LogLevelSilent, "")
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), logger)
+
+	uapi := fmt.Sprintf("private_key=%s\nlisten_port=%d\n", Hex(cfg.PrivateKey), cfg.ListenPort)
+	if err := dev.IpcSet(uapi); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("tunnel: configure device: %w", err)
+	}
+
+	if err := dev.Up(); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("tunnel: bring device up: %w", err)
+	}
+
+	return &Device{dev: dev, net: tnet}, nil
+}
+
+func (d *Device) Close() {
+	d.dev.Close()
+}
+
+func (d *Device) Net() *netstack.Net {
+	return d.net
+}
+
+// uapiConfig reads the device's current configuration back via the UAPI
+// get operation. Used by tests to confirm a set actually took effect.
+func (d *Device) uapiConfig() (string, error) {
+	var buf bytes.Buffer
+	if err := d.dev.IpcGetOperation(&buf); err != nil {
+		return "", fmt.Errorf("tunnel: read device config: %w", err)
+	}
+	return buf.String(), nil
+}

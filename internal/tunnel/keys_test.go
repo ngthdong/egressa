@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -151,5 +153,76 @@ func TestDecodeBase64_Errors(t *testing.T) {
 				t.Error("expected error, got nil")
 			}
 		})
+	}
+}
+
+func TestLoadOrCreatePrivateKey_EmptyPath(t *testing.T) {
+	kp1, err := LoadOrCreatePrivateKey("")
+	if err != nil {
+		t.Fatalf("LoadOrCreatePrivateKey: %v", err)
+	}
+	kp2, err := LoadOrCreatePrivateKey("")
+	if err != nil {
+		t.Fatalf("LoadOrCreatePrivateKey: %v", err)
+	}
+	if kp1.Private == kp2.Private {
+		t.Error("LoadOrCreatePrivateKey(\"\") returned the same key twice; expected a fresh one each call")
+	}
+}
+
+func TestLoadOrCreatePrivateKey_CreatesAndReloads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.key")
+
+	created, err := LoadOrCreatePrivateKey(path)
+	if err != nil {
+		t.Fatalf("LoadOrCreatePrivateKey (create): %v", err)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected %s to exist after create: %v", path, err)
+	}
+
+	loaded, err := LoadOrCreatePrivateKey(path)
+	if err != nil {
+		t.Fatalf("LoadOrCreatePrivateKey (reload): %v", err)
+	}
+	if loaded.Private != created.Private {
+		t.Error("reloaded private key does not match the one just created")
+	}
+}
+
+func TestLoadOrCreatePrivateKey_MalformedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.key")
+	if err := os.WriteFile(path, []byte("***not valid base64***"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := LoadOrCreatePrivateKey(path); err == nil {
+		t.Fatal("LoadOrCreatePrivateKey with a malformed key file: expected error, got nil")
+	}
+}
+
+// TestLoadOrCreatePrivateKey_UnreadableExistingFile covers the "exists but
+// os.ReadFile fails for a reason other than not-exist" branch, using a
+// directory in place of a file to get a deterministic, privilege-free
+// ReadFile error.
+func TestLoadOrCreatePrivateKey_UnreadableExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.key")
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	if _, err := LoadOrCreatePrivateKey(path); err == nil {
+		t.Fatal("LoadOrCreatePrivateKey with a directory at path: expected error, got nil")
+	}
+}
+
+// TestLoadOrCreatePrivateKey_SaveFails covers os.WriteFile's error branch
+// by pointing at a path inside a directory that doesn't exist.
+func TestLoadOrCreatePrivateKey_SaveFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "no-such-dir", "client.key")
+
+	if _, err := LoadOrCreatePrivateKey(path); err == nil {
+		t.Fatal("LoadOrCreatePrivateKey with an unwritable path: expected error, got nil")
 	}
 }

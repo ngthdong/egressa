@@ -1,8 +1,11 @@
 package tunnel
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -88,4 +91,18 @@ func waitForHandshake(t *testing.T, dev *Device, peerKey [KeySize]byte, timeout 
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("no handshake with peer %x within %s", peerKey, timeout)
+}
+
+func skipIfPrivilegedCommandFailed(t *testing.T, cmdName string, err error) {
+	t.Helper()
+	if errors.Is(err, exec.ErrNotFound) {
+		t.Skipf("skipping: %s not installed: %v", cmdName, err)
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "Permission denied") ||
+		strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "must be root") ||
+		strings.Contains(msg, "Operation not permitted") {
+		t.Skipf("skipping: insufficient privilege for %s: %v", cmdName, err)
+	}
 }

@@ -91,6 +91,78 @@ func TestNAT_AddCheckRemove(t *testing.T) {
 	}
 }
 
+func TestAddNAT_RemoveNAT(t *testing.T) {
+	rule := NATRule{Subnet: netip.MustParsePrefix("203.0.113.192/26")}
+	addErr := AddNAT(rule)
+	removeErr := RemoveNAT(rule)
+
+	if addErr != nil {
+		skipIfIptablesUnavailable(t, addErr)
+		t.Fatalf("AddNAT: %v", addErr)
+	}
+	if removeErr != nil {
+		t.Fatalf("RemoveNAT: %v", removeErr)
+	}
+}
+
+func TestForward_AddCheckRemove(t *testing.T) {
+	rule := ForwardRule{Interface: "egressa-fwd1"}
+
+	if has, err := HasForward(rule); err != nil {
+		skipIfIptablesUnavailable(t, err)
+		t.Fatalf("HasForward (before): %v", err)
+	} else if has {
+		t.Fatal("test rule already present before AddForward; a previous run may have leaked it")
+	}
+
+	if err := AddForward(rule); err != nil {
+		skipIfIptablesUnavailable(t, err)
+		t.Fatalf("AddForward: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = RemoveForward(rule)
+	})
+
+	has, err := HasForward(rule)
+	if err != nil {
+		t.Fatalf("HasForward (after add): %v", err)
+	}
+	if !has {
+		t.Fatal("expected rule to be present after AddForward")
+	}
+
+	if err := RemoveForward(rule); err != nil {
+		t.Fatalf("RemoveForward: %v", err)
+	}
+
+	has, err = HasForward(rule)
+	if err != nil {
+		t.Fatalf("HasForward (after remove): %v", err)
+	}
+	if has {
+		t.Error("expected rule to be gone after RemoveForward")
+	}
+}
+
+// TestAddForward_RemoveForward calls AddForward and RemoveForward
+// directly, unlike TestForward_AddCheckRemove, which checks HasForward
+// first and so skips before ever reaching them in an unprivileged
+// environment.
+func TestAddForward_RemoveForward(t *testing.T) {
+	rule := ForwardRule{Interface: "egressa-fwd2"}
+
+	addErr := AddForward(rule)
+	removeErr := RemoveForward(rule)
+
+	if addErr != nil {
+		skipIfIptablesUnavailable(t, addErr)
+		t.Fatalf("AddForward: %v", addErr)
+	}
+	if removeErr != nil {
+		t.Fatalf("RemoveForward: %v", removeErr)
+	}
+}
+
 func TestHasNAT_AbsentByDefault(t *testing.T) {
 	rule := NATRule{Subnet: netip.MustParsePrefix("203.0.113.128/25")}
 

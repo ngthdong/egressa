@@ -56,7 +56,69 @@ func RemoveNAT(rule NATRule) error {
 }
 
 func HasNAT(rule NATRule) (bool, error) {
-	out, err := exec.Command("iptables", rule.args("-C")...).CombinedOutput()
+	return ruleExists(rule.args("-C"))
+}
+
+// ForwardRule allows traffic to and from Interface through the kernel's
+// FORWARD chain.
+//
+// This is needed in addition to EnableIPForwarding and NATRule:
+// net.ipv4.ip_forward only lets the kernel consider forwarding a packet at
+// all, and a NATRule only rewrites the source address on the way out —
+// neither overrides the FORWARD chain's own policy. Many hosts default
+// that policy to DROP independent of ip_forward (notably anything with
+// Docker installed, which does this for container isolation), so
+// ip_forward+NAT alone silently produces "no connectivity, no error"
+// instead of a working gateway, unless something explicitly ACCEPTs the
+// tunnel's traffic here.
+type ForwardRule struct {
+	Interface string
+}
+
+func (r ForwardRule) inArgs(command string) []string {
+	return []string{command, "FORWARD", "-i", r.Interface, "-j", "ACCEPT"}
+}
+
+func (r ForwardRule) outArgs(command string) []string {
+	return []string{command, "FORWARD", "-o", r.Interface, "-j", "ACCEPT"}
+}
+
+func AddForward(rule ForwardRule) error {
+	if err := runIptables(rule.inArgs("-A")); err != nil {
+		return err
+	}
+	if err := runIptables(rule.outArgs("-A")); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RemoveForward removes both directions of rule, attempting each
+// regardless of whether the other fails, and joins any errors together.
+func RemoveForward(rule ForwardRule) error {
+	errIn := runIptables(rule.inArgs("-D"))
+	errOut := runIptables(rule.outArgs("-D"))
+	return errors.Join(errIn, errOut)
+}
+
+// HasForward reports whether both directions of rule are present.
+func HasForward(rule ForwardRule) (bool, error) {
+	in, err := ruleExists(rule.inArgs("-C"))
+	if err != nil {
+		return false, err
+	}
+	out, err := ruleExists(rule.outArgs("-C"))
+	if err != nil {
+		return false, err
+	}
+	return in && out, nil
+}
+
+// ruleExists runs an "iptables -C ..." check and reports whether the rule
+// is present: exit code 1 means "no such rule" (not an error), any other
+// nonzero exit is a real failure (e.g. insufficient privilege).
+func ruleExists(checkArgs []string) (bool, error) {
+	out, err := exec.Command("iptables", checkArgs...).CombinedOutput()
 	if err == nil {
 		return true, nil
 	}

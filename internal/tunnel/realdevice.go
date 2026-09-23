@@ -24,8 +24,10 @@ type RealConfig struct {
 	OnSessionPacket func(wire.SessionHeader)
 }
 
+// RealDevice wraps a wireguard-go device backed by a real, OS-level TUN
+// interface. Creating one needs CAP_NET_ADMIN / root; see NewReal.
 type RealDevice struct {
-	dev  *device.Device
+	peerManager
 	tun  tun.Device
 	name string
 }
@@ -63,11 +65,7 @@ func NewReal(cfg RealConfig) (*RealDevice, error) {
 		return nil, fmt.Errorf("tunnel: bring device up: %w", err)
 	}
 
-	return &RealDevice{dev: dev, tun: realTUN, name: actualName}, nil
-}
-
-func (d *RealDevice) Close() {
-	d.dev.Close()
+	return &RealDevice{peerManager: peerManager{dev: dev}, tun: realTUN, name: actualName}, nil
 }
 
 func (d *RealDevice) Name() string {

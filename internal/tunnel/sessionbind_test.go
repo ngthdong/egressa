@@ -126,3 +126,54 @@ func TestSessionBind_SetMark(t *testing.T) {
 		t.Fatalf("SetMark: %v", err)
 	}
 }
+
+// fakeBind is a minimal conn.Bind whose one ReceiveFunc yields whatever
+// datagrams a test preloads into it, so sessionBind's receive-side framing
+// can be unit tested without a real network round trip.
+type fakeBind struct {
+	recv func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error)
+}
+
+func (b fakeBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	return []conn.ReceiveFunc{b.recv}, port, nil
+}
+func (fakeBind) Close() error                       { return nil }
+func (fakeBind) SetMark(uint32) error               { return nil }
+func (fakeBind) Send([][]byte, conn.Endpoint) error { return nil }
+func (fakeBind) ParseEndpoint(string) (conn.Endpoint, error) {
+	return nil, nil
+}
+func (fakeBind) BatchSize() int { return 1 }
+
+// TestSessionBind_WrapReceiveFunc_DropsShortDatagram checks that a
+// datagram too short to have carried a session header is dropped rather
+// than handed to wireguard-go, which would otherwise choke on it.
+func TestSessionBind_WrapReceiveFunc_DropsShortDatagram(t *testing.T) {
+	real := fakeBind{
+		recv: func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+			copy(packets[0], []byte{1, 2, 3})
+			sizes[0] = 3
+			return 1, nil
+		},
+	}
+	b := newSessionBind(real, 0, 0, nil)
+
+	fns, _, err := b.Open(0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(fns) != 1 {
+		t.Fatalf("Open returned %d ReceiveFuncs, want 1", len(fns))
+	}
+
+	packets := [][]byte{make([]byte, 100)}
+	sizes := make([]int, 1)
+	eps := make([]conn.Endpoint, 1)
+	n, err := fns[0](packets, sizes, eps)
+	if err != nil {
+		t.Fatalf("wrapped ReceiveFunc: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("n = %d, want 0 (short datagram should be dropped)", n)
+	}
+}

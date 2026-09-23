@@ -91,6 +91,20 @@ func TestNAT_AddCheckRemove(t *testing.T) {
 	}
 }
 
+func TestAddNAT_RemoveNAT(t *testing.T) {
+	rule := NATRule{Subnet: netip.MustParsePrefix("203.0.113.192/26")}
+	addErr := AddNAT(rule)
+	removeErr := RemoveNAT(rule)
+
+	if addErr != nil {
+		skipIfIptablesUnavailable(t, addErr)
+		t.Fatalf("AddNAT: %v", addErr)
+	}
+	if removeErr != nil {
+		t.Fatalf("RemoveNAT: %v", removeErr)
+	}
+}
+
 func TestHasNAT_AbsentByDefault(t *testing.T) {
 	rule := NATRule{Subnet: netip.MustParsePrefix("203.0.113.128/25")}
 

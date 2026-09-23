@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"os"
 )
 
 const KeySize = 32
@@ -71,4 +72,35 @@ func DecodeBase64(s string) ([KeySize]byte, error) {
 	}
 	copy(key[:], b)
 	return key, nil
+}
+
+func LoadOrCreatePrivateKey(path string) (KeyPair, error) {
+	if path == "" {
+		kp, err := GenerateKeyPair()
+		if err != nil {
+			return KeyPair{}, err
+		}
+		return kp, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err == nil {
+		priv, err := DecodeBase64(string(data))
+		if err != nil {
+			return KeyPair{}, fmt.Errorf("tunnel: parse private key at %s: %w", path, err)
+		}
+		return KeyPair{Private: priv}, nil
+	}
+	if !os.IsNotExist(err) {
+		return KeyPair{}, fmt.Errorf("tunnel: read private key at %s: %w", path, err)
+	}
+
+	kp, err := GenerateKeyPair()
+	if err != nil {
+		return KeyPair{}, err
+	}
+	if err := os.WriteFile(path, []byte(Base64(kp.Private)), 0600); err != nil {
+		return KeyPair{}, fmt.Errorf("tunnel: save private key to %s: %w", path, err)
+	}
+	return kp, nil
 }

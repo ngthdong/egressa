@@ -153,7 +153,10 @@ func (d *Device) ListenPort() (uint16, error) {
 
 // LastHandshake returns the time of the most recent Noise handshake with
 // the peer identified by publicKey, or the zero Time if none has happened
-// yet.
+// yet. Resolution is nanosecond, not second: on a fast loopback test,
+// two handshakes can easily complete within the same wall-clock second,
+// so comparing LastHandshake results with time.Time.After needs the full
+// precision UAPI actually reports.
 func (d *Device) LastHandshake(publicKey [KeySize]byte) (time.Time, error) {
 	cfg, err := d.uapiConfig()
 	if err != nil {
@@ -162,7 +165,7 @@ func (d *Device) LastHandshake(publicKey [KeySize]byte) (time.Time, error) {
 
 	want := Hex(publicKey)
 	var inPeer bool
-	var sec int64
+	var sec, nsec int64
 	for _, line := range strings.Split(cfg, "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
@@ -178,12 +181,27 @@ func (d *Device) LastHandshake(publicKey [KeySize]byte) (time.Time, error) {
 					return time.Time{}, fmt.Errorf("tunnel: parse last_handshake_time_sec: %w", err)
 				}
 			}
+		case "last_handshake_time_nsec":
+			if inPeer {
+				nsec, err = strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return time.Time{}, fmt.Errorf("tunnel: parse last_handshake_time_nsec: %w", err)
+				}
+			}
 		}
 	}
-	if sec == 0 {
+	if sec == 0 && nsec == 0 {
 		return time.Time{}, nil
 	}
-	return time.Unix(sec, 0), nil
+	return time.Unix(sec, nsec), nil
+}
+
+func (d *Device) RemovePeer(publicKey [KeySize]byte) error {
+	uapi := fmt.Sprintf("public_key=%s\nremove=true\n", Hex(publicKey))
+	if err := d.dev.IpcSet(uapi); err != nil {
+		return fmt.Errorf("tunnel: remove peer: %w", err)
+	}
+	return nil
 }
 
 // PeerStats returns the number of bytes sent to and received from the

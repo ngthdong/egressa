@@ -80,6 +80,20 @@ func TestGateway_RealInternetRoundTrip(t *testing.T) {
 		t.Fatalf("EnableIPForwarding: %v", err)
 	}
 
+	// net.ipv4.ip_forward alone only lets the kernel consider forwarding;
+	// it does not override the FORWARD chain's own policy, which hosts
+	// with Docker installed (this one included) commonly default to DROP
+	// for container isolation. Without this, ip_forward+NAT alone produces
+	// silent packet loss, not an error, on exactly this test's path.
+	forwardRule := ForwardRule{Interface: gw.Name()}
+	if err := AddForward(forwardRule); err != nil {
+		skipIfPrivilegedCommandFailed(t, "iptables", err)
+		t.Fatalf("AddForward: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = RemoveForward(forwardRule)
+	})
+
 	natRule := NATRule{Subnet: vpnSubnet}
 	if err := AddNAT(natRule); err != nil {
 		skipIfPrivilegedCommandFailed(t, "iptables", err)

@@ -5,9 +5,6 @@ import (
 	"testing"
 )
 
-// TestAddPeer_RemovePeer_ClosedDevice checks that AddPeer and RemovePeer
-// surface the underlying IPC error once the device is closed, rather than
-// silently no-oping.
 func TestAddPeer_RemovePeer_ClosedDevice(t *testing.T) {
 	kp, err := GenerateKeyPair()
 	if err != nil {

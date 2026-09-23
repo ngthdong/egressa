@@ -15,8 +15,10 @@ concurrency:
 
 env:
   GO_VERSION: "1.26.4"
-  COVERAGE_PACKAGES: "./pkg/... ./internal/..."
-  COVERAGE_THRESHOLD: "90"
+  STRICT_PACKAGES: "./pkg/... ./internal/buildinfo/..."
+  STRICT_THRESHOLD: "90"
+  TUNNEL_PACKAGES: "./internal/tunnel/..."
+  TUNNEL_THRESHOLD: "75"
 
 jobs:
   quality:
@@ -50,6 +52,7 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          install-mode: goinstall
 
   tests:
     name: Test suite
@@ -66,26 +69,54 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Run tests (race detector on) with coverage
+      - name: Run strict-package tests with coverage
         run: |
           go test -race -count=1 \
-            -coverprofile=coverage.out -covermode=atomic \
-            ${{ env.COVERAGE_PACKAGES }}
+            -coverprofile=coverage-strict.out -covermode=atomic \
+            ${{ env.STRICT_PACKAGES }}
 
-      - name: Enforce coverage threshold
+      - name: Enforce strict coverage threshold
         run: |
-          go tool cover -func=coverage.out | tail -1
-          COVERAGE=$(go tool cover -func=coverage.out | grep '^total:' | awk '{print $NF}' | tr -d '%')
-          echo "Total coverage on ${{ env.COVERAGE_PACKAGES }}: ${COVERAGE}%"
-          awk -v cov="$COVERAGE" -v th="${{ env.COVERAGE_THRESHOLD }}" \
+          go tool cover -func=coverage-strict.out | tail -1
+          COVERAGE=$(go tool cover -func=coverage-strict.out | grep '^total:' | awk '{print $NF}' | tr -d '%')
+          echo "Coverage on ${{ env.STRICT_PACKAGES }}: ${COVERAGE}%"
+          awk -v cov="$COVERAGE" -v th="${{ env.STRICT_THRESHOLD }}" \
             'BEGIN { if (cov + 0 < th + 0) { print "::error::coverage " cov "% is below the " th "% threshold"; exit 1 } }'
 
-      - name: Upload coverage report
+      - name: Run tunnel package tests with coverage (unprivileged)
+        run: |
+          go test -race -count=1 \
+            -coverprofile=coverage-tunnel.out -covermode=atomic \
+            ${{ env.TUNNEL_PACKAGES }}
+
+      - name: Enforce tunnel coverage threshold
+        run: |
+          go tool cover -func=coverage-tunnel.out | tail -1
+          COVERAGE=$(go tool cover -func=coverage-tunnel.out | grep '^total:' | awk '{print $NF}' | tr -d '%')
+          echo "Coverage on ${{ env.TUNNEL_PACKAGES }} (unprivileged): ${COVERAGE}%"
+          awk -v cov="$COVERAGE" -v th="${{ env.TUNNEL_THRESHOLD }}" \
+            'BEGIN { if (cov + 0 < th + 0) { print "::error::coverage " cov "% is below the " th "% threshold"; exit 1 } }'
+
+      - name: Build tunnel test binary for the privileged run
+        run: go test -race -c -o tunnel.test ./internal/tunnel/
+
+      - name: Grant CAP_NET_ADMIN to the tunnel test binary
+        run: sudo setcap cap_net_admin+ep ./tunnel.test
+
+      - name: Run privileged tunnel tests (real TUN device, TestNewReal*)
+        run: ./tunnel.test -test.v -test.run TestNewReal
+
+      - name: Run privileged NAT and end-to-end tests (iptables)
+        run: sudo $(which go) test -race -count=1 -run 'TestEnableIPForwarding|TestNAT_|TestHasNAT_|TestGateway_RealInternetRoundTrip' -v ./internal/tunnel/...
+
+      - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
-          path: coverage.out
+          name: coverage-reports
+          path: |
+            coverage-strict.out
+            coverage-tunnel.out
           if-no-files-found: error
 
   build:
@@ -120,4 +151,4 @@ jobs:
         with:
           name: egressa-binaries
           path: bin/
-          if-no-files-found: warn
+          if-no-files-found: error

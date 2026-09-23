@@ -57,14 +57,14 @@ func New(cfg Config) (*Device, error) {
 		mtu = DefaultMTU
 	}
 
-	tun, tnet, err := netstack.CreateNetTUN(cfg.Addresses, nil, mtu)
+	realTUN, tnet, err := netstack.CreateNetTUN(cfg.Addresses, nil, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("tunnel: create TUN: %w", err)
 	}
-	bind := newSessionBind(conn.NewDefaultBind(), cfg.SessionID, cfg.Epoch, cfg.OnSessionPacket)
+	wrappedBind := newSessionBind(conn.NewDefaultBind(), cfg.SessionID, cfg.Epoch, cfg.OnSessionPacket)
 
 	logger := device.NewLogger(device.LogLevelSilent, "")
-	dev := device.NewDevice(tun, bind, logger)
+	dev := device.NewDevice(realTUN, wrappedBind, logger)
 
 	uapi := fmt.Sprintf("private_key=%s\nlisten_port=%d\n", Hex(cfg.PrivateKey), cfg.ListenPort)
 	if err := dev.IpcSet(uapi); err != nil {

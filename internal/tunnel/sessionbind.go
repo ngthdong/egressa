@@ -12,24 +12,12 @@ import (
 // sessionBind wraps a real conn.Bind, prepending a wire.SessionHeader to
 // every outbound UDP datagram and stripping it off every inbound one, in
 // the datagram's cleartext framing, outside WireGuard's own encryption.
-//
-// This header cannot ride inside the WireGuard-encrypted payload (i.e. as
-// part of what tun.Device.Read/Write see): wireguard-go's receive path
-// unconditionally validates that a decrypted packet starts with a real
-// IPv4/IPv6 header whose source address is in the peer's AllowedIPs
-// (device/receive.go), and silently drops anything else, with no way to
-// disable that check. Wrapping conn.Bind instead means WireGuard always
-// encrypts and decrypts a genuine IP packet — our header sits on the
-// datagram that carries that ciphertext, which WireGuard itself never
-// parses.
 type sessionBind struct {
 	real      conn.Bind
 	sessionID uint64
 	epoch     uint32
 	seq       atomic.Uint64
 
-	// onRecv, if set, is called with every inbound datagram's decoded
-	// header before the remainder is handed to wireguard-go.
 	onRecv func(wire.SessionHeader)
 }
 
@@ -49,9 +37,6 @@ func (b *sessionBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	return wrapped, actualPort, nil
 }
 
-// wrapReceiveFunc strips the session header from each datagram real
-// yields, compacting the packets/sizes/eps slices in place to skip any
-// datagram too short to have carried one.
 func (b *sessionBind) wrapReceiveFunc(real conn.ReceiveFunc) conn.ReceiveFunc {
 	return func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		n, err := real(packets, sizes, eps)

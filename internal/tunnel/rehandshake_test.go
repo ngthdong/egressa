@@ -23,10 +23,10 @@ func TestVirtualIP_StableAcrossRehandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenTCP: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	echo := func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		buf := make([]byte, 64)
 		for {
 			n, err := conn.Read(buf)
@@ -76,7 +76,7 @@ func TestVirtualIP_StableAcrossRehandshake(t *testing.T) {
 
 	// Baseline: a connection opened before the reset works normally.
 	conn := dial()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if got := roundTrip(conn, "before reset"); got != "before reset" {
 		t.Fatalf("baseline echo mismatch: got %q", got)
 	}
@@ -121,7 +121,7 @@ func TestVirtualIP_StableAcrossRehandshake(t *testing.T) {
 	// gateway. It is dialed from the exact same client.Net() instance, so
 	// this is only possible if the client's virtual IP never moved.
 	conn2 := dial()
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 	if got := roundTrip(conn2, "new conn, same IP"); got != "new conn, same IP" {
 		t.Fatalf("new-connection echo mismatch: got %q", got)
 	}

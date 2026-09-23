@@ -8,12 +8,16 @@ import (
 	"testing"
 	"time"
 
+	"golang.zx2c4.com/wireguard/conn"
+
 	"github.com/ngthdong/egressa/pkg/wire"
 )
 
 // TestSessionHeader_RoundTrip proves the session-layer hook actually
-// carries session_id and epoch through the wire, inside WireGuard's own
-// encryption, by observing the decoded header on the receiving side.
+// carries session_id and epoch through the wire, on the cleartext UDP
+// datagram that carries WireGuard's own encrypted payload (see
+// sessionbind.go for why it can't ride inside that encryption), by
+// observing the decoded header on the receiving side.
 func TestSessionHeader_RoundTrip(t *testing.T) {
 	clientAddr := netip.MustParseAddr("10.99.0.1")
 	gatewayAddr := netip.MustParseAddr("10.99.0.2")
@@ -110,5 +114,15 @@ func TestSessionHeader_RoundTrip(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for a session packet at the gateway")
+	}
+}
+
+// TestSessionBind_SetMark checks that sessionBind forwards SetMark to the
+// wrapped conn.Bind rather than silently swallowing it, since it's the one
+// conn.Bind method sessionBind doesn't otherwise touch.
+func TestSessionBind_SetMark(t *testing.T) {
+	b := newSessionBind(conn.NewDefaultBind(), 0, 0, nil)
+	if err := b.SetMark(0); err != nil {
+		t.Fatalf("SetMark: %v", err)
 	}
 }

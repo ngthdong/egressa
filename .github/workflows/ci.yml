@@ -106,6 +106,9 @@ jobs:
       - name: Run privileged tunnel tests (real TUN device, TestNewReal*)
         run: ./tunnel.test -test.v -test.run TestNewReal
 
+      - name: Run privileged NAT tests (iptables)
+        run: sudo go test -race -count=1 -run 'TestEnableIPForwarding|TestNAT_|TestHasNAT_' -v ./internal/tunnel/...
+
       - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@v4

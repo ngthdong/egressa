@@ -6,14 +6,34 @@ import (
 	"testing"
 )
 
-// skipIfNoTUNPermission lets a test degrade to a skip, instead of a
-// failure, in environments without CAP_NET_ADMIN (a plain developer
-// machine, an unprivileged CI runner). Any other error is a real
-// failure.
 func skipIfNoTUNPermission(t *testing.T, err error) {
 	t.Helper()
 	if errors.Is(err, ErrPermissionDenied) {
 		t.Skipf("skipping: %v (run as root / with CAP_NET_ADMIN to exercise this test)", err)
+	}
+}
+
+func TestClassifyTUNError(t *testing.T) {
+	cases := []struct {
+		name           string
+		err            error
+		wantPermission bool
+	}{
+		{"os.ErrPermission", os.ErrPermission, true},
+		{"message: operation not permitted", errors.New("operation not permitted"), true},
+		{"message: permission denied", errors.New("permission denied"), true},
+		{"generic error", errors.New("no such device"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTUNError("egressa-t0", tc.err)
+			if got == nil {
+				t.Fatal("classifyTUNError returned nil")
+			}
+			if isPermission := errors.Is(got, ErrPermissionDenied); isPermission != tc.wantPermission {
+				t.Errorf("classifyTUNError(%v): errors.Is(_, ErrPermissionDenied) = %v, want %v", tc.err, isPermission, tc.wantPermission)
+			}
+		})
 	}
 }
 
@@ -80,13 +100,6 @@ func TestNewReal_MultipleInstances(t *testing.T) {
 	}
 }
 
-// TestNewReal_MTU checks that wireguard-go's own TUN layer reports back
-// the MTU we requested. It deliberately does NOT check
-// /sys/class/net/.../mtu (the kernel-visible interface MTU): whether
-// CreateTUN pushes the requested MTU down to the kernel via an ioctl, or
-// only tracks it internally, is not something this project has
-// independently confirmed. Asserting a specific kernel-level value here
-// would be a guess, not a verified fact.
 func TestNewReal_MTU(t *testing.T) {
 	kp, err := GenerateKeyPair()
 	if err != nil {

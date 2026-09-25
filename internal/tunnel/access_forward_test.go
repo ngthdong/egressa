@@ -2,12 +2,10 @@ package tunnel
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
-	"os"
 	"testing"
 	"time"
 )
@@ -72,53 +70,14 @@ func TestAccessForwardsToBackbone(t *testing.T) {
 		t.Fatalf("GenerateKeyPair (egress TUN-B): %v", err)
 	}
 
-	// Access, client-facing side (TUN-A).
-	accessA, err := NewReal(RealConfig{PrivateKey: accessAKP.Private, InterfaceName: accessAIface})
-	if err != nil {
-		skipIfNoTUNPermission(t, err)
-		t.Fatalf("NewReal (access TUN-A): %v", err)
-	}
-	t.Cleanup(accessA.Close)
-	if err := ConfigureInterface(accessA.Name(), netip.PrefixFrom(accessAAddr, 24)); err != nil {
-		skipIfPrivilegedCommandFailed(t, "ip", err)
-		t.Fatalf("ConfigureInterface (access TUN-A): %v", err)
-	}
-
-	// Access, egress-facing side (TUN-B).
-	accessB, err := NewReal(RealConfig{PrivateKey: accessBKP.Private, InterfaceName: accessBIface})
-	if err != nil {
-		t.Fatalf("NewReal (access TUN-B): %v", err)
-	}
-	t.Cleanup(accessB.Close)
-	if err := ConfigureInterface(accessB.Name(), netip.PrefixFrom(accessBAddr, 24)); err != nil {
-		t.Fatalf("ConfigureInterface (access TUN-B): %v", err)
-	}
-
-	// Access forwards between its own two interfaces.
-	originalForwarding, err := IPForwardingEnabled()
-	if err != nil {
-		t.Fatalf("IPForwardingEnabled: %v", err)
-	}
-	t.Cleanup(func() {
-		val := []byte("0\n")
-		if originalForwarding {
-			val = []byte("1\n")
-		}
-		_ = os.WriteFile(ipForwardPath, val, 0644)
-	})
-	if err := EnableIPForwarding(); err != nil {
-		if errors.Is(err, os.ErrPermission) {
-			t.Skipf("skipping: %v (needs root)", err)
-		}
-		t.Fatalf("EnableIPForwarding: %v", err)
-	}
-
 	// access is wrapped in both roles at once for this test: its TUN-A
 	// side plays access, and nothing about TUN-B needs NAT either.
 	// It forwards to a peer, not to the real Internet. Only a true
 	// egress (below) ever NATs.
-	accessRoleA := NewAccessGateway(accessA)
-	accessRoleB := NewAccessGateway(accessB)
+	accessRoleA, accessRoleB := setupAccessGateway(t,
+		accessAKP.Private, accessAIface, accessAAddr,
+		accessBKP.Private, accessBIface, accessBAddr,
+	)
 
 	// Egress, backbone side (TUN-B).
 	egressB, err := NewReal(RealConfig{PrivateKey: egressBKP.Private, InterfaceName: egressBIface})

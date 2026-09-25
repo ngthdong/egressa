@@ -67,6 +67,22 @@ func TestFullThreeHopInternet(t *testing.T) {
 
 	enableForwardingWithCleanup(t)
 
+	// net.ipv4.ip_forward alone only lets the kernel consider forwarding;
+	// it does not override the FORWARD chain's own policy, which hosts
+	// with Docker installed commonly default to DROP for container
+	// isolation. Without this, ip_forward+NAT alone produces silent
+	// packet loss, not an error, on egress's TUN-B -> real Internet hop
+	// (see e2e_internet_test.go, which needs the same rule for the same
+	// reason on its own single combined gateway).
+	egressForwardRule := ForwardRule{Interface: egressB.Name()}
+	if err := AddForward(egressForwardRule); err != nil {
+		skipIfPrivilegedCommandFailed(t, "iptables", err)
+		t.Fatalf("AddForward (egress): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = RemoveForward(egressForwardRule)
+	})
+
 	egressRole := NewEgressGateway(egressB)
 
 	// The client subnet, not the backbone subnet: see the doc comment

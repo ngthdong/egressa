@@ -46,7 +46,11 @@ func (m *peerManager) AddPeer(
 		fmt.Fprintf(&b, "allowed_ip=%s\n", ip.String())
 	}
 	if keepaliveInterval > 0 {
-		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", int(keepaliveInterval.Seconds()))
+		seconds := int(keepaliveInterval.Round(time.Second) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", seconds)
 	}
 
 	if err := m.dev.IpcSet(b.String()); err != nil {

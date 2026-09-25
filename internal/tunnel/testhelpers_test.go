@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -105,4 +106,57 @@ func skipIfPrivilegedCommandFailed(t *testing.T, cmdName string, err error) {
 		strings.Contains(msg, "Operation not permitted") {
 		t.Skipf("skipping: insufficient privilege for %s: %v", cmdName, err)
 	}
+}
+
+func enableForwardingWithCleanup(t *testing.T) {
+	t.Helper()
+	original, err := IPForwardingEnabled()
+	if err != nil {
+		t.Fatalf("IPForwardingEnabled: %v", err)
+	}
+	t.Cleanup(func() {
+		val := []byte("0\n")
+		if original {
+			val = []byte("1\n")
+		}
+		_ = os.WriteFile(ipForwardPath, val, 0644)
+	})
+	if err := EnableIPForwarding(); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("skipping: %v (needs root)", err)
+		}
+		t.Fatalf("EnableIPForwarding: %v", err)
+	}
+}
+
+func setupAccessGateway(
+	t *testing.T,
+	aKey [KeySize]byte, aIface string, aAddr netip.Addr,
+	bKey [KeySize]byte, bIface string, bAddr netip.Addr,
+) (roleA, roleB *AccessGateway) {
+	t.Helper()
+
+	devA, err := NewReal(RealConfig{PrivateKey: aKey, InterfaceName: aIface})
+	if err != nil {
+		skipIfNoTUNPermission(t, err)
+		t.Fatalf("NewReal (access, client-facing): %v", err)
+	}
+	t.Cleanup(devA.Close)
+	if err := ConfigureInterface(devA.Name(), netip.PrefixFrom(aAddr, 24)); err != nil {
+		skipIfPrivilegedCommandFailed(t, "ip", err)
+		t.Fatalf("ConfigureInterface (access, client-facing): %v", err)
+	}
+
+	devB, err := NewReal(RealConfig{PrivateKey: bKey, InterfaceName: bIface})
+	if err != nil {
+		t.Fatalf("NewReal (access, backbone-facing): %v", err)
+	}
+	t.Cleanup(devB.Close)
+	if err := ConfigureInterface(devB.Name(), netip.PrefixFrom(bAddr, 24)); err != nil {
+		t.Fatalf("ConfigureInterface (access, backbone-facing): %v", err)
+	}
+
+	enableForwardingWithCleanup(t)
+
+	return NewAccessGateway(devA), NewAccessGateway(devB)
 }

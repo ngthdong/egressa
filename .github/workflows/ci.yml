@@ -107,7 +107,7 @@ jobs:
         run: ./tunnel.test -test.v -test.run 'TestNewReal|TestAccessGateway_DelegatesToRealDevice'
 
       - name: Run privileged NAT and end-to-end tests (iptables)
-        run: sudo $(which go) test -race -count=1 -run 'TestEnableIPForwarding|TestNAT_|TestHasNAT_|TestGateway_RealInternetRoundTrip|TestEgressGateway_ConfigureNAT|TestAccessForwardsToBackbone' -v ./internal/tunnel/...
+        run: sudo $(which go) test -race -count=1 -run 'TestEnableIPForwarding|TestNAT_|TestHasNAT_|TestGateway_RealInternetRoundTrip|TestEgressGateway_ConfigureNAT|TestAccessForwardsToBackbone|TestFullThreeHopInternet' -v ./internal/tunnel/...
 
       - name: Upload coverage reports
         if: always()

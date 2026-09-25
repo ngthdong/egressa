@@ -136,7 +136,7 @@ func TestFullThreeHopInternet(t *testing.T) {
 			"environment has no real outbound internet access -- check "+
 			"that manually before assuming it is a code bug", realInternetTarget, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	t.Logf("TCP handshake with %s completed through access+egress (local=%s remote=%s)",
 		realInternetTarget, conn.LocalAddr(), conn.RemoteAddr())

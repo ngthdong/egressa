@@ -44,13 +44,14 @@ func SegmentCost(s SegmentStats, w CostWeights) float64 {
 		tailPremium = 0
 	}
 	latency := s.P50Micros + w.TailWeight*tailPremium
+	return latency + lossPenalty(s.LossRate, w.LossWeight)
+}
 
-	if s.LossRate >= 1 {
+func lossPenalty(p, weight float64) float64 {
+	if p >= 1 {
 		return math.Inf(1)
 	}
-	lossPenalty := -math.Log(1-s.LossRate) * w.LossWeight
-
-	return latency + lossPenalty
+	return -math.Log(1-p) * weight
 }
 
 type GateReason int
@@ -127,42 +128,59 @@ func ScorePath(c PathCandidate, w CostWeights) PathScore {
 // The caller must ensure that the specified suffix is semantically shared
 // by both candidates; this function only validates its structural bounds.
 func PathDifferential(a, b PathCandidate, sharedSuffixLen int, w CostWeights) (float64, error) {
+	differingA, differingB, err := validateDifferential(a, b, sharedSuffixLen, w)
+	if err != nil {
+		return 0, err
+	}
+	return differingCost(differingA, w) - differingCost(differingB, w), nil
+}
+
+// validateDifferential checks the structural and shared-suffix
+// preconditions that any same-egress differential comparison needs ,
+// and returns each candidate's differing segments.
+func validateDifferential(a, b PathCandidate, sharedSuffixLen int, w CostWeights) (differingA, differingB []SegmentStats, err error) {
 	if a.EgressID != b.EgressID {
-		return 0, fmt.Errorf("measurement: PathDifferential requires the same egress, got %q and %q", a.EgressID, b.EgressID)
+		return nil, nil, fmt.Errorf("measurement: requires the same egress, got %q and %q", a.EgressID, b.EgressID)
 	}
 	if sharedSuffixLen < 0 {
-		return 0, fmt.Errorf("measurement: sharedSuffixLen must be >= 0, got %d", sharedSuffixLen)
+		return nil, nil, fmt.Errorf("measurement: sharedSuffixLen must be >= 0, got %d", sharedSuffixLen)
 	}
 	if sharedSuffixLen > len(a.Segments) || sharedSuffixLen > len(b.Segments) {
-		return 0, fmt.Errorf("measurement: sharedSuffixLen %d exceeds a candidate's segment count (a has %d, b has %d)", sharedSuffixLen, len(a.Segments), len(b.Segments))
+		return nil, nil, fmt.Errorf("measurement: sharedSuffixLen %d exceeds a candidate's segment count (a has %d, b has %d)", sharedSuffixLen, len(a.Segments), len(b.Segments))
 	}
 
 	if sharedSuffixLen > 0 {
 		for _, seg := range a.Segments[len(a.Segments)-sharedSuffixLen:] {
 			if seg.LossRate >= w.LossGate {
-				return 0, fmt.Errorf("measurement: PathDifferential: shared suffix is gated (loss %.4f >= %.4f) -- this egress cannot serve this destination, not a differential decision", seg.LossRate, w.LossGate)
+				return nil, nil, fmt.Errorf("measurement: shared suffix is gated (loss %.4f >= %.4f). This egress cannot serve this destination, not a differential decision", seg.LossRate, w.LossGate)
 			}
 		}
 	}
 	if a.CapacityFraction >= w.MaxCapacityFraction || b.CapacityFraction >= w.MaxCapacityFraction {
-		return 0, fmt.Errorf("measurement: PathDifferential: the shared egress is at/over capacity -- this egress cannot serve this destination, not a differential decision")
+		return nil, nil, fmt.Errorf("measurement: the shared egress is at/over capacity. This egress cannot serve this destination, not a differential decision")
 	}
 
-	diffA := differingCost(a.Segments, sharedSuffixLen, w)
-	diffB := differingCost(b.Segments, sharedSuffixLen, w)
-	return diffA - diffB, nil
+	return a.Segments[:len(a.Segments)-sharedSuffixLen], b.Segments[:len(b.Segments)-sharedSuffixLen], nil
 }
 
 // differingCost returns the cost of the non-shared prefix.
 // A loss-gated segment makes the prefix cost +Inf.
-func differingCost(segs []SegmentStats, sharedSuffixLen int, w CostWeights) float64 {
-	differing := segs[:len(segs)-sharedSuffixLen]
+func differingCost(segs []SegmentStats, w CostWeights) float64 {
 	total := 0.0
-	for _, seg := range differing {
+	for _, seg := range segs {
 		if seg.LossRate >= w.LossGate {
 			return math.Inf(1)
 		}
 		total += SegmentCost(seg, w)
 	}
 	return total
+}
+
+func segmentsGated(segs []SegmentStats, w CostWeights) bool {
+	for _, s := range segs {
+		if s.LossRate >= w.LossGate {
+			return true
+		}
+	}
+	return false
 }

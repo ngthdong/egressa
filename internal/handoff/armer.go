@@ -113,6 +113,17 @@ func (a *StandbyArmer) MarkReady(session string, epoch uint64) error {
 	return nil
 }
 
+func (a *StandbyArmer) ConsumeReady(session string, epoch uint64) (AccessState, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, found := a.arms[session]
+	if !found || e.phase != PhaseReady || e.targetEpoch != epoch {
+		return AccessState{}, false
+	}
+	delete(a.arms, session)
+	return e.state, true
+}
+
 func (a *StandbyArmer) Reset(session string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

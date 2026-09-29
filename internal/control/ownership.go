@@ -31,6 +31,12 @@ func (r OwnershipRecord) NextEpoch(newEgress string) OwnershipRecord {
 	return r
 }
 
+func (r OwnershipRecord) NextAccessEpoch(newAccess string) OwnershipRecord {
+	r.Access = newAccess
+	r.Epoch++
+	return r
+}
+
 func (r OwnershipRecord) Newer(existing OwnershipRecord) bool {
 	return r.Epoch > existing.Epoch
 }

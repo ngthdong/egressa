@@ -64,6 +64,23 @@ func TestOwnershipRecord_NextEpoch(t *testing.T) {
 	}
 }
 
+func TestOwnershipRecord_NextAccessEpoch(t *testing.T) {
+	rec := OwnershipRecord{Session: "s1", Access: "a1", Egress: "hk", Epoch: 3}
+	next := rec.NextAccessEpoch("a2")
+	if next.Epoch != 4 {
+		t.Fatalf("NextAccessEpoch().Epoch = %d, want 4", next.Epoch)
+	}
+	if next.Access != "a2" {
+		t.Fatalf("NextAccessEpoch().Access = %q, want %q", next.Access, "a2")
+	}
+	if next.Egress != "hk" {
+		t.Fatalf("NextAccessEpoch().Egress = %q, want unchanged %q (access handoff must not touch egress)", next.Egress, "hk")
+	}
+	if rec.Epoch != 3 || rec.Access != "a1" {
+		t.Fatalf("NextAccessEpoch mutated the receiver: %+v", rec)
+	}
+}
+
 func TestOwnershipRecord_Newer(t *testing.T) {
 	base := OwnershipRecord{Session: "s1", Access: "a1", Egress: "hk", Epoch: 5}
 	cases := []struct {

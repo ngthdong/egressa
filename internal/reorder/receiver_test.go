@@ -323,3 +323,74 @@ func TestReceiver_TCPStreamSurvivesCutover(t *testing.T) {
 		t.Fatalf("PendingCount() = %d, want 0 once the whole stream has drained", pending)
 	}
 }
+
+func TestReceiver_Close_ReturnsPendingInOrderAndClosesToFurtherReceives(t *testing.T) {
+	r := NewReceiver(Config{WindowSize: 8}, 1, 0)
+
+	// Deliver seq 1, then leave a gap: seq 3 and 5 arrive but seq 2 and
+	// 4 never do.
+	if _, reason := r.Receive(pkt(1, 1)); reason != NotDropped {
+		t.Fatalf("Receive(seq 1): reason = %v", reason)
+	}
+	if _, reason := r.Receive(pkt(1, 5)); reason != NotDropped {
+		t.Fatalf("Receive(seq 5): reason = %v", reason)
+	}
+	if _, reason := r.Receive(pkt(1, 3)); reason != NotDropped {
+		t.Fatalf("Receive(seq 3): reason = %v", reason)
+	}
+	if got := r.PendingCount(); got != 2 {
+		t.Fatalf("PendingCount() before Close = %d, want 2", got)
+	}
+
+	stuck := r.Close()
+	if len(stuck) != 2 {
+		t.Fatalf("Close() returned %d packets, want 2", len(stuck))
+	}
+	if stuck[0].Seq != 3 || stuck[1].Seq != 5 {
+		t.Fatalf("Close() = seqs %d,%d, want increasing order 3,5", stuck[0].Seq, stuck[1].Seq)
+	}
+	if got := r.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after Close = %d, want 0 (the buffer was actually cleared, not just reported)", got)
+	}
+	if !r.Closed() {
+		t.Fatal("Closed() = false after Close()")
+	}
+
+	// Anything arriving after Close, however legitimate it would
+	// otherwise have been, must be refused, including the very seq 2
+	// that would have unblocked the gap.
+	out, reason := r.Receive(pkt(1, 2))
+	if reason != DropClosed {
+		t.Fatalf("Receive after Close: reason = %v, want %v", reason, DropClosed)
+	}
+	if out != nil {
+		t.Fatalf("Receive after Close returned non-nil deliverable: %+v", out)
+	}
+}
+
+func TestReceiver_Close_NothingPending_ReturnsNil(t *testing.T) {
+	r := NewReceiver(DefaultConfig, 1, 0)
+	if _, reason := r.Receive(pkt(1, 1)); reason != NotDropped {
+		t.Fatalf("Receive(seq 1): reason = %v", reason)
+	}
+	// Nothing was left stuck: seq 1 was delivered immediately, no gap
+	// was ever open.
+	if stuck := r.Close(); stuck != nil {
+		t.Fatalf("Close() = %+v, want nil (nothing was pending)", stuck)
+	}
+}
+
+func TestReceiver_Close_Idempotent(t *testing.T) {
+	r := NewReceiver(DefaultConfig, 1, 0)
+	if _, reason := r.Receive(pkt(1, 2)); reason != NotDropped { // buffered, gap at seq 1
+		t.Fatalf("Receive(seq 2): reason = %v", reason)
+	}
+	first := r.Close()
+	if len(first) != 1 {
+		t.Fatalf("first Close() = %+v, want exactly 1 stuck packet", first)
+	}
+	second := r.Close()
+	if second != nil {
+		t.Fatalf("second Close() = %+v, want nil (nothing left to flush)", second)
+	}
+}

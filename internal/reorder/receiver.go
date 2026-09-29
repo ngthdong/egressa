@@ -2,6 +2,7 @@ package reorder
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -18,6 +19,7 @@ const (
 	DropEpochStale
 	DropDuplicate
 	DropOutOfWindow
+	DropClosed
 )
 
 func (r DropReason) String() string {
@@ -47,6 +49,7 @@ type Receiver struct {
 	currentEpoch uint64
 	delivered    uint64 // highest Seq delivered so far
 	pending      map[uint64]Packet
+	closed       bool
 }
 
 func NewReceiver(cfg Config, epoch uint64, seedSeq uint64) *Receiver {
@@ -70,6 +73,9 @@ func (r *Receiver) Receive(pkt Packet) (deliverable []Packet, reason DropReason)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.closed {
+		return nil, DropClosed
+	}
 	if pkt.Epoch < r.currentEpoch {
 		return nil, DropEpochStale
 	}
@@ -119,4 +125,37 @@ func (r *Receiver) PendingCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.pending)
+}
+
+// Close stops the Receiver and returns packets still buffered at close.
+func (r *Receiver) Close() (pendingAtClose []Packet) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	if len(r.pending) == 0 {
+		return nil
+	}
+
+	seqs := make([]uint64, 0, len(r.pending))
+	for seq := range r.pending {
+		seqs = append(seqs, seq)
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+
+	out := make([]Packet, 0, len(seqs))
+	for _, seq := range seqs {
+		out = append(out, r.pending[seq])
+		delete(r.pending, seq)
+	}
+	return out
+}
+
+func (r *Receiver) Closed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
 }

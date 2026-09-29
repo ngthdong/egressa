@@ -309,6 +309,105 @@ func TestStandbyArmer_ConcurrentSessions_RaceFree(t *testing.T) {
 	wg.Wait()
 }
 
+func TestStandbyArmer_ConsumeReady_Succeeds(t *testing.T) {
+	a := NewStandbyArmer()
+	state := AccessState{SessionID: "s1", VirtualIP: "10.0.0.1", SeqHighWater: 7}
+	if err := a.Prepare("s1", 0, state, time.Now()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := a.MarkReady("s1", 1); err != nil {
+		t.Fatalf("MarkReady: %v", err)
+	}
+
+	got, ok := a.ConsumeReady("s1", 1)
+	if !ok {
+		t.Fatal("ConsumeReady() ok = false for a Ready arm at the right epoch")
+	}
+	if got != state {
+		t.Fatalf("ConsumeReady() state = %+v, want %+v", got, state)
+	}
+	if phase := a.Phase("s1"); phase != PhaseIdle {
+		t.Fatalf("phase after ConsumeReady = %v, want %v (consumed)", phase, PhaseIdle)
+	}
+	if _, _, _, _, ok := a.Snapshot("s1"); ok {
+		t.Fatal("Snapshot ok = true after ConsumeReady consumed the arm")
+	}
+}
+
+func TestStandbyArmer_ConsumeReady_FailsWhenNotReady(t *testing.T) {
+	a := NewStandbyArmer()
+	if err := a.Prepare("s1", 0, AccessState{SessionID: "s1", VirtualIP: "10.0.0.1"}, time.Now()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	if _, ok := a.ConsumeReady("s1", 1); ok {
+		t.Fatal("ConsumeReady() ok = true for an arm that is only Prepare, not Ready")
+	}
+	if phase := a.Phase("s1"); phase != PhasePrepare {
+		t.Fatalf("phase after failed ConsumeReady = %v, want unchanged %v", phase, PhasePrepare)
+	}
+}
+
+func TestStandbyArmer_ConsumeReady_FailsWhenEpochMismatch(t *testing.T) {
+	a := NewStandbyArmer()
+	if err := a.Prepare("s1", 0, AccessState{SessionID: "s1", VirtualIP: "10.0.0.1"}, time.Now()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := a.MarkReady("s1", 1); err != nil {
+		t.Fatalf("MarkReady: %v", err)
+	}
+
+	if _, ok := a.ConsumeReady("s1", 2); ok {
+		t.Fatal("ConsumeReady() ok = true for the wrong epoch")
+	}
+	if phase := a.Phase("s1"); phase != PhaseReady {
+		t.Fatalf("phase after failed ConsumeReady = %v, want unchanged %v", phase, PhaseReady)
+	}
+}
+
+func TestStandbyArmer_ConsumeReady_FailsForUnknownSession(t *testing.T) {
+	a := NewStandbyArmer()
+	if _, ok := a.ConsumeReady("nope", 0); ok {
+		t.Fatal("ConsumeReady() ok = true for a session that was never armed")
+	}
+}
+
+func TestStandbyArmer_ConsumeReady_ConcurrentConsumers_ExactlyOneWins(t *testing.T) {
+	a := NewStandbyArmer()
+	if err := a.Prepare("s1", 0, AccessState{SessionID: "s1", VirtualIP: "10.0.0.1"}, time.Now()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := a.MarkReady("s1", 1); err != nil {
+		t.Fatalf("MarkReady: %v", err)
+	}
+
+	const n = 50
+	var wg sync.WaitGroup
+	wins := make([]bool, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, ok := a.ConsumeReady("s1", 1)
+			wins[i] = ok
+		}(i)
+	}
+	wg.Wait()
+
+	winners := 0
+	for _, ok := range wins {
+		if ok {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("winners = %d, want exactly 1 among %d concurrent ConsumeReady calls", winners, n)
+	}
+	if phase := a.Phase("s1"); phase != PhaseIdle {
+		t.Fatalf("phase after the race = %v, want %v", phase, PhaseIdle)
+	}
+}
+
 var egressNames = []string{"hk", "sg", "jp", "us", "de", "uk", "fr", "kr", "in", "br"}
 
 func egressName(i int) string {

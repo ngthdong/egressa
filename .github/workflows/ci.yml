@@ -15,7 +15,7 @@ concurrency:
 
 env:
   GO_VERSION: "1.26.4"
-  STRICT_PACKAGES: "./pkg/... ./internal/buildinfo/..."
+  STRICT_PACKAGES: "./pkg/... ./internal/buildinfo/... ./internal/measurement/... ./internal/control/... ./internal/handoff/... ./internal/reorder/..."
   STRICT_THRESHOLD: "90"
   TUNNEL_PACKAGES: "./internal/tunnel/..."
   TUNNEL_THRESHOLD: "75"

@@ -157,6 +157,25 @@ func TestRender_GatewayAcceptsAnyRemote_NoDPD(t *testing.T) {
 	}
 }
 
+func TestConnection_RemoteIDAny(t *testing.T) {
+	c := gatewayConn()
+	c.RemoteID = AnyID
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate with RemoteID %%any: %v", err)
+	}
+	got, err := Render([]Connection{c})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(got, "id = %any") {
+		t.Errorf("rendered config lacks the %%any remote id:\n%s", got)
+	}
+	c.LocalID = AnyID
+	if err := c.Validate(); err == nil {
+		t.Error("Validate accepted %any as the local identity")
+	}
+}
+
 func TestRender_PubkeyHasNoSecretsSection(t *testing.T) {
 	c := clientConn()
 	c.Auth, c.PSK, c.LocalPubkey, c.RemotePubkey = AuthPubkey, "", "client-1.pub", "gw-hk.pub"

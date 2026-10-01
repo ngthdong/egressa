@@ -30,6 +30,10 @@ var (
 	DefaultESPProposals = []string{"aes256gcm16-x25519"}
 )
 
+// AnyID as a RemoteID accepts any peer identity: a gateway's single
+// responder connection uses it for all of its clients.
+const AnyID = "%any"
+
 // Connection describes one IKEv2 connection to a peer and its CHILD_SA.
 type Connection struct {
 	// Name identifies the IKE connection. The CHILD_SA name is derived
@@ -95,23 +99,13 @@ func (c Connection) Validate() error {
 	if !idRE.MatchString(c.LocalID) {
 		return fmt.Errorf("ipsec: connection %s: LocalID %q must match %s", c.Name, c.LocalID, idRE)
 	}
-	if !idRE.MatchString(c.RemoteID) {
-		return fmt.Errorf("ipsec: connection %s: RemoteID %q must match %s", c.Name, c.RemoteID, idRE)
+	if c.RemoteID != AnyID && !idRE.MatchString(c.RemoteID) {
+		return fmt.Errorf("ipsec: connection %s: RemoteID %q must be %s or match %s", c.Name, c.RemoteID, AnyID, idRE)
 	}
 	switch c.Auth {
 	case AuthPSK:
-		if len(c.PSK) < minPSKLen {
-			return fmt.Errorf(
-				"ipsec: connection %s: PSK must be at least %d characters", c.Name, minPSKLen,
-			)
-		}
-		for _, r := range c.PSK {
-			if r < 0x21 || r > 0x7e || r == '"' || r == '\\' {
-				return fmt.Errorf(
-					"ipsec: connection %s: PSK may only contain printable ASCII without spaces, quotes or backslashes",
-					c.Name,
-				)
-			}
+		if err := validatePSK("connection "+c.Name, c.PSK); err != nil {
+			return err
 		}
 	case AuthPubkey:
 		if !fileRE.MatchString(c.LocalPubkey) || !fileRE.MatchString(c.RemotePubkey) {
@@ -149,6 +143,22 @@ func (c Connection) Validate() error {
 	case "", StartNone, StartStart:
 	default:
 		return fmt.Errorf("ipsec: connection %s: unknown start action %q", c.Name, c.Start)
+	}
+	return nil
+}
+
+// validatePSK checks a pre-shared key: long enough, and printable ASCII
+// without spaces, quotes or backslashes so it never needs quoting in
+// swanctl.conf.
+func validatePSK(owner, psk string) error {
+	if len(psk) < minPSKLen {
+		return fmt.Errorf("ipsec: %s: PSK must be at least %d characters", owner, minPSKLen)
+	}
+	for _, r := range psk {
+		if r < 0x21 || r > 0x7e || r == '"' || r == '\\' {
+			return fmt.Errorf(
+				"ipsec: %s: PSK may only contain printable ASCII without spaces, quotes or backslashes", owner)
+		}
 	}
 	return nil
 }

@@ -30,6 +30,10 @@ var (
 	DefaultESPProposals = []string{"aes256gcm16-x25519"}
 )
 
+// AnyID as a RemoteID accepts any peer identity: a gateway's single
+// responder connection uses it for all of its clients.
+const AnyID = "%any"
+
 // Connection describes one IKEv2 connection to a peer and its CHILD_SA.
 type Connection struct {
 	// Name identifies the IKE connection. The CHILD_SA name is derived
@@ -95,8 +99,8 @@ func (c Connection) Validate() error {
 	if !idRE.MatchString(c.LocalID) {
 		return fmt.Errorf("ipsec: connection %s: LocalID %q must match %s", c.Name, c.LocalID, idRE)
 	}
-	if !idRE.MatchString(c.RemoteID) {
-		return fmt.Errorf("ipsec: connection %s: RemoteID %q must match %s", c.Name, c.RemoteID, idRE)
+	if c.RemoteID != AnyID && !idRE.MatchString(c.RemoteID) {
+		return fmt.Errorf("ipsec: connection %s: RemoteID %q must be %s or match %s", c.Name, c.RemoteID, AnyID, idRE)
 	}
 	switch c.Auth {
 	case AuthPSK:

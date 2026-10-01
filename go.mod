@@ -3,6 +3,7 @@ module github.com/ngthdong/egressa
 go 1.26
 
 require (
+	github.com/strongswan/govici v0.8.2
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
 	go.etcd.io/etcd/client/v3 v3.7.2

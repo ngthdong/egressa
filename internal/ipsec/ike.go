@@ -47,9 +47,11 @@ type IKE interface {
 }
 
 // SharedSecret is one IKE pre-shared key. Owners are the identities it
-// applies to; AnyID among them matches any peer identity, but less
-// specifically than a concrete identity does, so a key naming both peers
-// always wins over one naming a single side and AnyID.
+// applies to. When verifying a peer's pre-shared key, charon tries every
+// loaded key that names either side of the exchange, not only the best
+// match, so two keys that share an owner each authenticate the other's
+// peers; keep roles apart by giving each its own identities (see
+// GatewayConfig.BackboneID).
 type SharedSecret struct {
 	ID     string
 	PSK    string

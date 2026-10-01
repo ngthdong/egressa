@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 )
 
 const KeySize = 32
@@ -38,6 +39,17 @@ func clamp(k *[KeySize]byte) {
 	k[0] &= 248
 	k[31] &= 127
 	k[31] |= 64
+}
+
+// PublicKey derives the X25519 public key of a private key.
+func PublicKey(private [KeySize]byte) ([KeySize]byte, error) {
+	var pub [KeySize]byte
+	priv, err := ecdh.X25519().NewPrivateKey(private[:])
+	if err != nil {
+		return pub, fmt.Errorf("tunnel: derive public key: %w", err)
+	}
+	copy(pub[:], priv.PublicKey().Bytes())
+	return pub, nil
 }
 
 func Hex(key [KeySize]byte) string {
@@ -85,11 +97,15 @@ func LoadOrCreatePrivateKey(path string) (KeyPair, error) {
 
 	data, err := os.ReadFile(path)
 	if err == nil {
-		priv, err := DecodeBase64(string(data))
+		priv, err := DecodeBase64(strings.TrimSpace(string(data)))
 		if err != nil {
 			return KeyPair{}, fmt.Errorf("tunnel: parse private key at %s: %w", path, err)
 		}
-		return KeyPair{Private: priv}, nil
+		pub, err := PublicKey(priv)
+		if err != nil {
+			return KeyPair{}, err
+		}
+		return KeyPair{Private: priv, Public: pub}, nil
 	}
 	if !os.IsNotExist(err) {
 		return KeyPair{}, fmt.Errorf("tunnel: read private key at %s: %w", path, err)

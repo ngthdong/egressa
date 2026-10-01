@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"net/netip"
+	"os"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -32,6 +33,9 @@ type Config struct {
 	// decoded session header, before the packet is delivered locally.
 	// Optional; used for observability and tests.
 	OnSessionPacket func(wire.SessionHeader)
+	// Admit, if set, is called with every inbound packet's session header
+	// before WireGuard sees the packet; returning false drops it.
+	Admit func(wire.SessionHeader) bool
 }
 
 // Device wraps a wireguard-go device backed by a userspace (netstack) TUN.
@@ -39,7 +43,8 @@ type Config struct {
 // be created and torn down freely in tests.
 type Device struct {
 	peerManager
-	net *netstack.Net
+	net  *netstack.Net
+	bind *sessionBind
 }
 
 func New(cfg Config) (*Device, error) {
@@ -53,8 +58,9 @@ func New(cfg Config) (*Device, error) {
 		return nil, fmt.Errorf("tunnel: create TUN: %w", err)
 	}
 	wrappedBind := newSessionBind(conn.NewDefaultBind(), cfg.SessionID, cfg.Epoch, cfg.OnSessionPacket)
+	wrappedBind.admit = cfg.Admit
 
-	logger := device.NewLogger(device.LogLevelSilent, "")
+	logger := newLogger("netstack")
 	dev := device.NewDevice(realTUN, wrappedBind, logger)
 
 	uapi := fmt.Sprintf("private_key=%s\nlisten_port=%d\n", Hex(cfg.PrivateKey), cfg.ListenPort)
@@ -68,7 +74,20 @@ func New(cfg Config) (*Device, error) {
 		return nil, fmt.Errorf("tunnel: bring device up: %w", err)
 	}
 
-	return &Device{peerManager: peerManager{dev: dev}, net: tnet}, nil
+	return &Device{peerManager: peerManager{dev: dev}, net: tnet, bind: wrappedBind}, nil
+}
+
+// SetEpoch changes the epoch stamped into every packet sent from now on,
+// after a migration commits.
+func (d *Device) SetEpoch(epoch uint32) { d.bind.setEpoch(epoch) }
+
+// newLogger is silent unless EGRESSA_WG_DEBUG=1, which logs every
+// handshake and keepalive wireguard-go sends or receives.
+func newLogger(name string) *device.Logger {
+	if os.Getenv("EGRESSA_WG_DEBUG") == "1" {
+		return device.NewLogger(device.LogLevelVerbose, "wireguard "+name+": ")
+	}
+	return device.NewLogger(device.LogLevelSilent, "")
 }
 
 func (d *Device) Net() *netstack.Net {

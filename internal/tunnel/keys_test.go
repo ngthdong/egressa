@@ -189,6 +189,9 @@ func TestLoadOrCreatePrivateKey_CreatesAndReloads(t *testing.T) {
 	if loaded.Private != created.Private {
 		t.Error("reloaded private key does not match the one just created")
 	}
+	if loaded.Public != created.Public {
+		t.Error("reloaded public key does not match the one just created")
+	}
 }
 
 func TestLoadOrCreatePrivateKey_MalformedFile(t *testing.T) {

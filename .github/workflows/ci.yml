@@ -15,7 +15,7 @@ concurrency:
 
 env:
   GO_VERSION: "1.26.4"
-  STRICT_PACKAGES: "./pkg/... ./internal/buildinfo/... ./internal/measurement/... ./internal/control/... ./internal/handoff/... ./internal/reorder/..."
+  STRICT_PACKAGES: "./pkg/... ./internal/buildinfo/... ./internal/measurement/... ./internal/control/... ./internal/handoff/... ./internal/reorder/... ./internal/ipsec/..."
   STRICT_THRESHOLD: "90"
   TUNNEL_PACKAGES: "./internal/tunnel/..."
   TUNNEL_THRESHOLD: "75"
@@ -111,6 +111,41 @@ jobs:
       - name: Run privileged NAT and end-to-end tests (iptables)
         run: sudo $(which go) test -race -count=1 -run 'TestEnableIPForwarding|TestNAT_|TestHasNAT_|TestGateway_RealInternetRoundTrip|TestEgressGateway_ConfigureNAT|TestAccessForwardsToBackbone' -v ./internal/tunnel/...
 
+      - name: Install strongSwan (charon and the vici plugin)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            strongswan-charon strongswan-swanctl libstrongswan-standard-plugins
+          # The tests start their own charons, one per network namespace;
+          # a system charon is not needed.
+          sudo systemctl stop strongswan strongswan-starter 2>/dev/null || true
+
+      - name: Remove the AppArmor profile confining charon
+        # The profile keeps charon from reading a test strongswan.conf or
+        # creating a vici socket in a temp dir.
+        run: |
+          if [ -f /etc/apparmor.d/usr.lib.ipsec.charon ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/usr.lib.ipsec.charon || true
+          fi
+
+      - name: Run privileged IPsec tests (real charon, TestIPsec_*)
+        # Dependencies are vendored, so the root build needs no module
+        # download. Here a skipped or missing test is a failure: the
+        # previous steps exist so that nothing is skipped.
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" go test -race -count=1 -v -run TestIPsec_ ./internal/ipsec/ | tee ipsec-e2e.log
+          if grep -q -- '--- SKIP' ipsec-e2e.log; then
+            echo "::error::IPsec end-to-end tests were skipped:"
+            grep -- 'skipping' ipsec-e2e.log
+            exit 1
+          fi
+          passed=$(grep -c -- '--- PASS: TestIPsec_' ipsec-e2e.log || true)
+          if [ "$passed" -lt 2 ]; then
+            echo "::error::expected TestIPsec_Backend and TestIPsec_Vici to pass, $passed did"
+            exit 1
+          fi
+
       - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -119,6 +154,7 @@ jobs:
           path: |
             coverage-strict.out
             coverage-tunnel.out
+            ipsec-e2e.log
           if-no-files-found: error
 
   build:

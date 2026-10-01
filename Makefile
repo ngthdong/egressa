@@ -45,14 +45,18 @@ fuzz: ## Run the wire-format fuzz test for 30s (extend -fuzztime for a real camp
 vet: ## go vet
 	$(GO) vet ./...
 
+# Every Go file except vendor/, which is third-party code kept exactly as
+# published (some of it is not gofmt-formatted) and must never be rewritten.
+GO_FILES = $$(find . -path ./vendor -prune -o -name '*.go' -print)
+
 .PHONY: fmt
-fmt: ## Reformat the tree with gofmt
-	gofmt -w .
+fmt: ## Reformat the tree with gofmt (vendor/ excluded)
+	gofmt -w $(GO_FILES)
 
 .PHONY: fmt-check
 fmt-check: ## Fail if any file is not gofmt-formatted, or if gofmt is missing (what CI runs)
 	@command -v gofmt >/dev/null 2>&1 || { echo "gofmt not found on PATH — is Go installed?"; exit 1; }
-	@unformatted=$$(gofmt -l .); \
+	@unformatted=$$(gofmt -l $(GO_FILES)); \
 	if [ -n "$$unformatted" ]; then \
 		echo "The following files are not gofmt-formatted:"; \
 		echo "$$unformatted"; \

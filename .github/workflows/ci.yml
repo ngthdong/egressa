@@ -37,8 +37,10 @@ jobs:
           cache: true
 
       - name: Check formatting (gofmt)
+        # vendor/ holds third-party code exactly as published; some of it is
+        # not gofmt-formatted, and it must never be edited, so skip it.
         run: |
-          unformatted=$(gofmt -l .)
+          unformatted=$(gofmt -l $(find . -path ./vendor -prune -o -name '*.go' -print))
           if [ -n "$unformatted" ]; then
             echo "::error::The following files are not gofmt-formatted:"
             echo "$unformatted"

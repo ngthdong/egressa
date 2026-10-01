@@ -196,6 +196,14 @@ func TestNetlinkNet_XfrmInterfaceLifecycle(t *testing.T) {
 	if got := h.addrs[0].IPNet.String(); got != "10.0.0.2/32" {
 		t.Fatalf("address = %s, want 10.0.0.2/32", got)
 	}
+	// An address on a subnet keeps its host part: masking it would assign
+	// the network address instead.
+	if err := n.AddAddr("egx7", netip.MustParsePrefix("192.0.2.1/24")); err != nil {
+		t.Fatalf("AddAddr: %v", err)
+	}
+	if got := h.addrs[1].IPNet.String(); got != "192.0.2.1/24" {
+		t.Fatalf("address = %s, want 192.0.2.1/24 (host part kept)", got)
+	}
 	if err := n.SetLinkUp("egx7"); err != nil || h.up[0] != "egx7" {
 		t.Fatalf("SetLinkUp: err=%v up=%v", err, h.up)
 	}

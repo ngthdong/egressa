@@ -36,6 +36,13 @@ func TestNetlinkNet_RealKernel(t *testing.T) {
 	if err := n.SetLinkUp("egt7"); err != nil {
 		t.Fatalf("SetLinkUp: %v", err)
 	}
+	// A subnet address must keep its host part (192.0.2.1, not .0).
+	if err := n.AddAddr("egt7", netip.MustParsePrefix("192.0.2.1/24")); err != nil {
+		t.Fatalf("AddAddr subnet: %v", err)
+	}
+	if got, err := n.RouteGet(netip.MustParseAddr("192.0.2.9")); err != nil || got.Src != netip.MustParseAddr("192.0.2.1") {
+		t.Fatalf("RouteGet on the subnet = %+v, %v; want src 192.0.2.1", got, err)
+	}
 
 	host := Route{Dst: netip.MustParsePrefix("203.0.113.0/24"), Dev: "egt7", Src: netip.MustParseAddr("10.205.0.2")}
 	if err := n.RouteAdd(host); err != nil {

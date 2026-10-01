@@ -101,7 +101,10 @@ func (n *NetlinkNet) AddAddr(name string, addr netip.Prefix) error {
 	if err != nil {
 		return err
 	}
-	if err := n.h.AddrAdd(link, &netlink.Addr{IPNet: prefixToIPNet(addr)}); err != nil {
+	// An interface address keeps its host bits (192.0.2.1/24, not the
+	// network 192.0.2.0/24), so it must not go through prefixToIPNet.
+	ipnet := &net.IPNet{IP: addr.Addr().AsSlice(), Mask: net.CIDRMask(addr.Bits(), addr.Addr().BitLen())}
+	if err := n.h.AddrAdd(link, &netlink.Addr{IPNet: ipnet}); err != nil {
 		return fmt.Errorf("ipsec: add address %s to %s: %w", addr, name, mapErr(err))
 	}
 	return nil

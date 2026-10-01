@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -151,6 +152,7 @@ func newTestBed(t *testing.T) *testBed {
 	}
 	tb.a.configure(t, la, addrA)
 	tb.b.configure(t, lb, addrB)
+	requireKernelIPsec(t, tb.a)
 	tb.a.start(t, charon)
 	tb.b.start(t, charon)
 	return tb
@@ -241,6 +243,9 @@ func (ns *testNS) start(t *testing.T, charon string) {
       default = 1
       ike = 2
       time_format = %%T
+      # without this charon buffers the log until it exits, and neither
+      # the start-up checks nor failure messages could read it
+      flush_line = yes
     }
   }
 }
@@ -275,6 +280,10 @@ func (ns *testNS) start(t *testing.T, charon string) {
 		if c, err := net.Dial("unix", ns.socket); err == nil {
 			_ = c.Close()
 			return
+		}
+		if loaded, ok := ns.loadedPlugins(); ok && !slices.Contains(loaded, "vici") {
+			t.Skipf("skipping: charon in %s runs without the vici plugin, which ships in "+
+				"strongswan-swanctl (or set %s to an unpacked libstrongswan-vici.so)", ns.name, envCharonPreload)
 		}
 		select {
 		case <-ns.exited:
@@ -318,6 +327,21 @@ func (ns *testNS) stop() {
 	}
 }
 
+// loadedPlugins returns the plugin list charon logs once it has loaded
+// them, and false until it has.
+func (ns *testNS) loadedPlugins() ([]string, bool) {
+	data, err := os.ReadFile(filepath.Join(ns.dir, "charon.log"))
+	if err != nil {
+		return nil, false
+	}
+	_, rest, ok := strings.Cut(string(data), "loaded plugins: ")
+	if !ok {
+		return nil, false
+	}
+	line, _, _ := strings.Cut(rest, "\n")
+	return strings.Fields(line), true
+}
+
 // log returns the tail of charon's log, for failure messages.
 func (ns *testNS) log() string {
 	f, err := os.Open(filepath.Join(ns.dir, "charon.log"))
@@ -347,4 +371,37 @@ func (ns *testNS) ike(t *testing.T) *ViciIKE {
 	}
 	t.Cleanup(func() { _ = v.Close() })
 	return v
+}
+
+// run runs a command inside the namespace's network stack.
+func (ns *testNS) run(args ...string) ([]byte, error) {
+	cmd := exec.Command("nsenter", append([]string{"--net=/var/run/netns/" + ns.name, "--"}, args...)...)
+	return cmd.CombinedOutput()
+}
+
+// requireKernelIPsec skips unless the kernel can do what every test here
+// needs: XFRM interfaces, and ESP states with AES-GCM (charon installs one
+// for every CHILD_SA, so without it not even a handshake completes).
+func requireKernelIPsec(t *testing.T, ns *testNS) {
+	t.Helper()
+	if err := ns.net.AddXfrmInterface("egprobe", 999, ""); err != nil {
+		t.Skipf("skipping: the kernel cannot create XFRM interfaces (CONFIG_XFRM_INTERFACE): %v", err)
+	}
+	_ = ns.net.DeleteLink("egprobe")
+	h, err := netlink.NewHandleAt(ns.handle)
+	if err != nil {
+		t.Fatalf("netlink handle in %s: %v", ns.name, err)
+	}
+	defer h.Close()
+	st := &netlink.XfrmState{
+		Src: net.ParseIP("192.0.2.200"), Dst: net.ParseIP("192.0.2.201"),
+		Proto: netlink.XFRM_PROTO_ESP, Mode: netlink.XFRM_MODE_TUNNEL,
+		Spi: 0x7e57, Reqid: 1, ReplayWindow: 32,
+		Aead: &netlink.XfrmStateAlgo{Name: "rfc4106(gcm(aes))", Key: make([]byte, 36), ICVLen: 128},
+	}
+	if err := h.XfrmStateAdd(st); err != nil {
+		t.Skipf("skipping: the kernel cannot install ESP states with AES-GCM "+
+			"(CONFIG_INET_ESP, CONFIG_CRYPTO_GCM, or the esp4 module): %v", err)
+	}
+	_ = h.XfrmStateDel(st)
 }

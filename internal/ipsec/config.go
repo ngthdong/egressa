@@ -104,18 +104,8 @@ func (c Connection) Validate() error {
 	}
 	switch c.Auth {
 	case AuthPSK:
-		if len(c.PSK) < minPSKLen {
-			return fmt.Errorf(
-				"ipsec: connection %s: PSK must be at least %d characters", c.Name, minPSKLen,
-			)
-		}
-		for _, r := range c.PSK {
-			if r < 0x21 || r > 0x7e || r == '"' || r == '\\' {
-				return fmt.Errorf(
-					"ipsec: connection %s: PSK may only contain printable ASCII without spaces, quotes or backslashes",
-					c.Name,
-				)
-			}
+		if err := validatePSK("connection "+c.Name, c.PSK); err != nil {
+			return err
 		}
 	case AuthPubkey:
 		if !fileRE.MatchString(c.LocalPubkey) || !fileRE.MatchString(c.RemotePubkey) {
@@ -153,6 +143,22 @@ func (c Connection) Validate() error {
 	case "", StartNone, StartStart:
 	default:
 		return fmt.Errorf("ipsec: connection %s: unknown start action %q", c.Name, c.Start)
+	}
+	return nil
+}
+
+// validatePSK checks a pre-shared key: long enough, and printable ASCII
+// without spaces, quotes or backslashes so it never needs quoting in
+// swanctl.conf.
+func validatePSK(owner, psk string) error {
+	if len(psk) < minPSKLen {
+		return fmt.Errorf("ipsec: %s: PSK must be at least %d characters", owner, minPSKLen)
+	}
+	for _, r := range psk {
+		if r < 0x21 || r > 0x7e || r == '"' || r == '\\' {
+			return fmt.Errorf(
+				"ipsec: %s: PSK may only contain printable ASCII without spaces, quotes or backslashes", owner)
+		}
 	}
 	return nil
 }

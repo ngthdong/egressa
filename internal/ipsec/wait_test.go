@@ -203,3 +203,26 @@ func waitForCond(cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+func TestIKESA_Warm(t *testing.T) {
+	for name, tc := range map[string]struct {
+		sa   IKESA
+		want bool
+	}{
+		"installed":       {IKESA{State: IKEStateEstablished, Children: []ChildSA{{State: ChildStateRekeyed}, {State: ChildStateInstalled}}}, true},
+		"no children":     {IKESA{State: IKEStateEstablished}, false},
+		"child not ready": {IKESA{State: IKEStateEstablished, Children: []ChildSA{{State: ChildStateInstalling}}}, false},
+		"not established": {IKESA{State: "CONNECTING", Children: []ChildSA{{State: ChildStateInstalled}}}, false},
+	} {
+		if got := tc.sa.Warm(); got != tc.want {
+			t.Errorf("%s: Warm() = %v, want %v", name, got, tc.want)
+		}
+	}
+	sas := []IKESA{{Name: "a", UniqueID: 3}, {Name: "a", UniqueID: 9}, {Name: "b", UniqueID: 20}}
+	if sa, ok := FindIKE(sas, "a"); !ok || sa.UniqueID != 9 {
+		t.Errorf("FindIKE = %+v, %v; want the newest", sa, ok)
+	}
+	if _, ok := FindIKE(sas, "c"); ok {
+		t.Error("FindIKE found a missing name")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 )
 
 // fakeHandle is an in-memory nlHandle. It records what NetlinkNet asked
@@ -459,5 +460,22 @@ func TestNetlinkHelpers(t *testing.T) {
 	}
 	if err := mapErr(syscall.EPERM); errors.Is(err, ErrExist) || errors.Is(err, ErrNotExist) {
 		t.Errorf("mapErr(EPERM) = %v, want it left alone", err)
+	}
+}
+
+func TestNewNetlinkNet(t *testing.T) {
+	// Opening netlink sockets needs no privilege; using them does.
+	n, err := NewNetlinkNet()
+	if err != nil {
+		t.Fatalf("NewNetlinkNet: %v", err)
+	}
+	n.Close()
+	n, err = NewNetlinkNetAt(netns.None())
+	if err != nil {
+		t.Fatalf("NewNetlinkNetAt(current namespace): %v", err)
+	}
+	n.Close()
+	if n, err := NewNetlinkNetAt(netns.NsHandle(1 << 20)); err == nil || n != nil {
+		t.Fatalf("NewNetlinkNetAt(bad handle) = %v, %v; want nil and an error", n, err)
 	}
 }

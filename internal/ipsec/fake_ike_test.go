@@ -22,6 +22,9 @@ type fakeIKE struct {
 
 	errs       map[string]error // by operation: "load-conn", "initiate", ...
 	onInitiate func(ctx context.Context, ike, child string) error
+	// honorCtx makes every call fail once its context is done, as the
+	// real daemon client does; it proves cleanup runs on a live context.
+	honorCtx bool
 
 	subs map[chan Event]struct{}
 }
@@ -46,6 +49,14 @@ func (f *fakeIKE) record(op string) error {
 	return nil
 }
 
+// ctxErr is the error a ctx-honouring daemon client would return.
+func (f *fakeIKE) ctxErr(ctx context.Context) error {
+	if f.honorCtx {
+		return ctx.Err()
+	}
+	return nil
+}
+
 func (f *fakeIKE) setErr(op string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -64,9 +75,12 @@ func (f *fakeIKE) listCount() int {
 	return f.lists
 }
 
-func (f *fakeIKE) LoadConn(_ context.Context, c Connection) error {
+func (f *fakeIKE) LoadConn(ctx context.Context, c Connection) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
 	if err := f.record("load-conn " + c.Name); err != nil {
 		return err
 	}
@@ -80,9 +94,12 @@ func (f *fakeIKE) LoadConn(_ context.Context, c Connection) error {
 	return nil
 }
 
-func (f *fakeIKE) UnloadConn(_ context.Context, name string) error {
+func (f *fakeIKE) UnloadConn(ctx context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
 	if err := f.record("unload-conn " + name); err != nil {
 		return err
 	}
@@ -96,9 +113,12 @@ func (f *fakeIKE) UnloadConn(_ context.Context, name string) error {
 	return nil
 }
 
-func (f *fakeIKE) LoadShared(_ context.Context, s SharedSecret) error {
+func (f *fakeIKE) LoadShared(ctx context.Context, s SharedSecret) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
 	if err := f.record("load-shared " + s.ID); err != nil {
 		return err
 	}
@@ -112,9 +132,12 @@ func (f *fakeIKE) LoadShared(_ context.Context, s SharedSecret) error {
 	return nil
 }
 
-func (f *fakeIKE) UnloadShared(_ context.Context, id string) error {
+func (f *fakeIKE) UnloadShared(ctx context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
 	if err := f.record("unload-shared " + id); err != nil {
 		return err
 	}
@@ -133,6 +156,9 @@ func (f *fakeIKE) Initiate(ctx context.Context, ike, child string) error {
 	err := f.record("initiate " + child)
 	if err == nil {
 		err = f.errs["initiate"]
+	}
+	if err == nil {
+		err = f.ctxErr(ctx)
 	}
 	hook := f.onInitiate
 	f.mu.Unlock()
@@ -177,9 +203,12 @@ func (f *fakeIKE) Initiate(ctx context.Context, ike, child string) error {
 	return nil
 }
 
-func (f *fakeIKE) TerminateIKE(_ context.Context, ike string) error {
+func (f *fakeIKE) TerminateIKE(ctx context.Context, ike string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
 	if err := f.record("terminate-ike " + ike); err != nil {
 		return err
 	}
@@ -189,9 +218,12 @@ func (f *fakeIKE) TerminateIKE(_ context.Context, ike string) error {
 	return f.removeIKELocked(func(s IKESA) bool { return s.Name == ike })
 }
 
-func (f *fakeIKE) TerminateIKEByID(_ context.Context, id uint64) error {
+func (f *fakeIKE) TerminateIKEByID(ctx context.Context, id uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
 	if err := f.record(fmt.Sprintf("terminate-ike-id %d", id)); err != nil {
 		return err
 	}
@@ -221,9 +253,12 @@ func (f *fakeIKE) removeIKELocked(match func(IKESA) bool) error {
 	return nil
 }
 
-func (f *fakeIKE) TerminateChild(_ context.Context, id uint64) error {
+func (f *fakeIKE) TerminateChild(ctx context.Context, id uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
 	if err := f.record(fmt.Sprintf("terminate-child %d", id)); err != nil {
 		return err
 	}
@@ -244,10 +279,13 @@ func (f *fakeIKE) TerminateChild(_ context.Context, id uint64) error {
 	return fmt.Errorf("terminate child %d: %w", id, ErrNotFound)
 }
 
-func (f *fakeIKE) ListSAs(_ context.Context, ike string) ([]IKESA, error) {
+func (f *fakeIKE) ListSAs(ctx context.Context, ike string) ([]IKESA, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lists++
+	if err := f.ctxErr(ctx); err != nil {
+		return nil, err
+	}
 	if err := f.errs["list"]; err != nil {
 		return nil, err
 	}
@@ -340,23 +378,4 @@ func (f *fakeIKE) dropIKE(conn string, announce bool) {
 		}
 	}
 	f.sas = kept
-}
-
-func (f *fakeIKE) secret(id string) (SharedSecret, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	s, ok := f.secrets[id]
-	return s, ok
-}
-
-func (f *fakeIKE) conn(name string) (Connection, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	c, ok := f.conns[name]
-	return c, ok
-}
-
-func (f *fakeIKE) allSAs() []IKESA {
-	sas, _ := f.ListSAs(context.Background(), "")
-	return sas
 }

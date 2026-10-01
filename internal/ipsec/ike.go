@@ -61,8 +61,8 @@ func (s SharedSecret) Validate() error {
 	if !idRE.MatchString(s.ID) {
 		return fmt.Errorf("ipsec: shared secret id %q must match %s", s.ID, idRE)
 	}
-	if len(s.PSK) < minPSKLen {
-		return fmt.Errorf("ipsec: shared secret %s: PSK must be at least %d characters", s.ID, minPSKLen)
+	if err := validatePSK("shared secret "+s.ID, s.PSK); err != nil {
+		return err
 	}
 	if len(s.Owners) == 0 {
 		return fmt.Errorf("ipsec: shared secret %s: no owners", s.ID)

@@ -230,11 +230,7 @@ func (v *ViciIKE) LoadConn(ctx context.Context, c Connection) error {
 }
 
 func (v *ViciIKE) UnloadConn(ctx context.Context, name string) error {
-	msg := vici.NewMessage()
-	if err := msg.Set("name", name); err != nil {
-		return err
-	}
-	_, err := v.call(ctx, "unload-conn", msg)
+	_, err := v.call(ctx, "unload-conn", newMsg("name", name))
 	return err
 }
 
@@ -242,50 +238,33 @@ func (v *ViciIKE) LoadShared(ctx context.Context, s SharedSecret) error {
 	if err := s.Validate(); err != nil {
 		return err
 	}
-	msg := vici.NewMessage()
-	for _, kv := range []struct {
-		k string
-		v any
-	}{
-		{"id", s.ID},
-		{"type", "IKE"},
+	msg := newMsg(
+		"id", s.ID,
+		"type", "IKE",
 		// load-shared takes the raw secret: unlike a swanctl.conf
 		// "secret =" line there is no 0x/0s prefix interpretation, so
 		// the PSK goes over verbatim and never touches the disk.
-		{"data", s.PSK},
-		{"owners", append([]string(nil), s.Owners...)},
-	} {
-		if err := msg.Set(kv.k, kv.v); err != nil {
-			return err
-		}
-	}
+		"data", s.PSK,
+		"owners", append([]string(nil), s.Owners...),
+	)
 	_, err := v.call(ctx, "load-shared", msg)
 	return err
 }
 
 func (v *ViciIKE) UnloadShared(ctx context.Context, id string) error {
-	msg := vici.NewMessage()
-	if err := msg.Set("id", id); err != nil {
-		return err
-	}
-	_, err := v.call(ctx, "unload-shared", msg)
+	_, err := v.call(ctx, "unload-shared", newMsg("id", id))
 	return err
 }
 
 func (v *ViciIKE) Initiate(ctx context.Context, ike, child string) error {
-	msg := vici.NewMessage()
-	for _, kv := range [][2]string{
-		{"child", child},
-		{"ike", ike},
-		{"timeout", timeoutMS(ctx, 0)},
+	msg := newMsg(
+		"child", child,
+		"ike", ike,
+		"timeout", timeoutMS(ctx, 0),
 		// control-log events at level 1 carry the notify errors (for
 		// example AUTHENTICATION_FAILED) that say why a failure happened.
-		{"loglevel", "1"},
-	} {
-		if err := msg.Set(kv[0], kv[1]); err != nil {
-			return err
-		}
-	}
+		"loglevel", "1",
+	)
 	return v.oneShot(ctx, func(s *vici.Session) error {
 		var logs []string
 		for m, err := range s.CallStreaming(ctx, "initiate", "control-log", msg) {
@@ -341,18 +320,13 @@ func (v *ViciIKE) TerminateChild(ctx context.Context, uniqueID uint64) error {
 }
 
 func (v *ViciIKE) terminate(ctx context.Context, selector, value string) error {
-	msg := vici.NewMessage()
-	for _, kv := range [][2]string{
-		{selector, value},
+	msg := newMsg(
+		selector, value,
 		// force: tear the SA down even if the peer never answers the
 		// DELETE, after waiting at most the timeout for it to.
-		{"force", "yes"},
-		{"timeout", timeoutMS(ctx, terminateGrace)},
-	} {
-		if err := msg.Set(kv[0], kv[1]); err != nil {
-			return err
-		}
-	}
+		"force", "yes",
+		"timeout", timeoutMS(ctx, terminateGrace),
+	)
 	return v.oneShot(ctx, func(s *vici.Session) error {
 		resp, err := s.Call(ctx, "terminate", msg)
 		if err == nil {
@@ -386,16 +360,11 @@ func timeoutMS(ctx context.Context, fallback time.Duration) string {
 }
 
 func (v *ViciIKE) ListSAs(ctx context.Context, ike string) ([]IKESA, error) {
-	msg := vici.NewMessage()
 	// noblock: answer from the current state even while another thread
 	// holds an IKE_SA, rather than waiting for it.
-	if err := msg.Set("noblock", "yes"); err != nil {
-		return nil, err
-	}
+	msg := newMsg("noblock", "yes")
 	if ike != "" {
-		if err := msg.Set("ike", ike); err != nil {
-			return nil, err
-		}
+		mustSet(msg, "ike", ike)
 	}
 	msgs, err := v.stream(ctx, "list-sas", "list-sa", msg)
 	if err != nil {

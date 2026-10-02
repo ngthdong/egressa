@@ -58,6 +58,8 @@ type Config struct {
 	Logger *slog.Logger
 	// Metrics, if set, receives the agent's metrics.
 	Metrics *telemetry.ClientMetrics
+	// Tracer, if set, logs a span for each phase of a migration.
+	Tracer *telemetry.Tracer
 }
 
 // pendingMigration is a move the client has decided on and asked the
@@ -376,13 +378,20 @@ func (a *Agent) adopt(sess api.Session) {
 		return
 	}
 	old := a.session
+	mctx := telemetry.WithMigration(context.Background(), sess.ID, sess.Epoch)
+	span := a.cfg.Tracer.Start(mctx, "migration.switch",
+		slog.String("access", sess.Access), slog.String("egress", sess.Egress),
+		slog.String("from_access", old.Access), slog.String("from_egress", old.Egress))
+	var switchErr error
 	// The epoch first: the new access may already fence older epochs.
 	a.dev.SetEpoch(uint32(sess.Epoch))
 	if sess.Access != old.Access {
 		g, ok := api.FindGateway(a.gateways, sess.Access)
 		if !ok {
+			switchErr = fmt.Errorf("new access gateway %s is unknown", sess.Access)
 			a.log.Warn("new access gateway is unknown", "access", sess.Access)
 		} else if err := a.configurePeerLocked(g, true); err != nil {
+			switchErr = err
 			a.log.Warn("switching the active peer failed", "access", sess.Access, telemetry.Err(err))
 		} else {
 			a.peers[g.ID] = g
@@ -403,6 +412,8 @@ func (a *Agent) adopt(sess api.Session) {
 	if !began.IsZero() {
 		a.cfg.Metrics.MigrationDuration(cause, now.Sub(began))
 	}
+	span.SetAttrs(slog.String("cause", cause))
+	span.End(switchErr)
 	a.log.InfoContext(telemetry.WithMigration(context.Background(), sess.ID, sess.Epoch), "path changed",
 		"access", sess.Access, "egress", sess.Egress, "from_access", old.Access, "from_egress", old.Egress)
 }
@@ -455,6 +466,7 @@ func (a *Agent) paths(now time.Time) (paths []Path, currentDead bool) {
 }
 
 func (a *Agent) decideOnce(ctx context.Context) {
+	began := a.cfg.Tracer.Now()
 	now := time.Now()
 	paths, dead := a.paths(now)
 	a.mu.Lock()
@@ -475,21 +487,33 @@ func (a *Agent) decideOnce(ctx context.Context) {
 	if !dec.Migrate {
 		return
 	}
+	// Every span of this move, in every process, shares the trace ID of
+	// the epoch it targets, even if the move loses to a conflict.
+	mctx := telemetry.WithMigration(context.Background(), sess.ID, sess.Epoch+1)
+	target := []slog.Attr{slog.String("access", dec.Access), slog.String("egress", dec.Egress)}
+	a.cfg.Tracer.StartAt(mctx, "migration.decide", began, append(target,
+		slog.String("cause", dec.Cause), slog.String("from_access", sess.Access), slog.String("from_egress", sess.Egress),
+		slog.String("reason", dec.Reason))...).End(nil)
 	a.log.InfoContext(a.logCtx(), "migrating", "access", dec.Access, "egress", dec.Egress, "reason", dec.Reason)
+	commit := a.cfg.Tracer.Start(mctx, "migration.commit", target...)
 	next, err := a.cfg.Controller.Migrate(ctx, sess.ID, a.secret, api.MigrateRequest{Epoch: sess.Epoch, Access: dec.Access, Egress: dec.Egress})
 	a.noteController(err)
 	var conflict *api.ConflictError
 	switch {
 	case errors.As(err, &conflict):
+		commit.SetAttrs(slog.Uint64("now_epoch", conflict.Current.Epoch))
+		commit.EndStatus(telemetry.StatusConflict, err)
 		a.log.InfoContext(a.logCtx(), "migration lost to a newer epoch", "now_epoch", conflict.Current.Epoch)
 		a.cfg.Metrics.Migration(dec.Cause, telemetry.ResultConflict)
 		a.clearPending()
 		a.adopt(conflict.Current)
 	case err != nil:
+		commit.End(err)
 		a.log.WarnContext(a.logCtx(), "migration failed; staying", telemetry.Err(err))
 		a.cfg.Metrics.Migration(dec.Cause, telemetry.ResultFailed)
 		a.clearPending()
 	default:
+		commit.End(nil)
 		a.adopt(next)
 	}
 }

@@ -54,6 +54,8 @@ type Config struct {
 	Logger *slog.Logger
 	// Metrics, if set, receives the agent's metrics.
 	Metrics *telemetry.GatewayMetrics
+	// Tracer, if set, logs a span each time a session's move is applied.
+	Tracer *telemetry.Tracer
 }
 
 type backbone struct {
@@ -93,6 +95,9 @@ type Agent struct {
 	fenced map[string]uint64
 	// carried counts the sessions of the plan last applied, for metrics.
 	accessSessions, egressSessions int
+	// applied is each session's path as last applied, to tell which
+	// sessions a plan moves.
+	applied map[string]SessionPath
 
 	stateVersion atomic.Uint64
 	controllerUp atomic.Bool
@@ -128,6 +133,7 @@ func New(cfg Config) (*Agent, error) {
 		forward:   make(map[netip.Addr]string),
 		ret:       make(map[netip.Addr]string),
 		fenced:    make(map[string]uint64),
+		applied:   make(map[string]SessionPath),
 	}
 	a.fence.Store(&map[uint64]uint64{})
 	return a, nil
@@ -430,7 +436,11 @@ func (a *Agent) indexLocked(id string) (int, error) {
 func (a *Agent) apply(p Plan) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	began := a.cfg.Tracer.Now()
 	var errs []error
+	// vipErrs keeps each virtual IP's routing error for its session's span.
+	vipErrs := make(map[netip.Addr]error)
+	defer func() { a.traceMovesLocked(p, began, vipErrs) }()
 
 	for id, b := range a.backbones {
 		if _, ok := p.Backbones[id]; !ok {
@@ -488,6 +498,7 @@ func (a *Agent) apply(p Plan) error {
 		}
 		if err := delRule(ruleFrom(vip, egressTableBase+a.index[egress])); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 		}
 		delete(a.forward, vip)
 	}
@@ -498,10 +509,12 @@ func (a *Agent) apply(p Plan) error {
 		n, err := a.indexLocked(egress)
 		if err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 			continue
 		}
 		if err := addRule(ruleFrom(vip, egressTableBase+n)); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 			continue
 		}
 		a.forward[vip] = egress
@@ -513,6 +526,7 @@ func (a *Agent) apply(p Plan) error {
 		}
 		if err := ipIgnore("route", "del", netip.PrefixFrom(vip, 32).String()); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 		}
 		delete(a.ret, vip)
 	}
@@ -526,12 +540,36 @@ func (a *Agent) apply(p Plan) error {
 		}
 		if err := ip("route", "replace", netip.PrefixFrom(vip, 32).String(), "dev", b.name); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 			continue
 		}
 		a.log.Info("return route changed", "virtual_ip", vip.String(), "access", access)
 		a.ret[vip] = access
 	}
 	return errors.Join(errs...)
+}
+
+// traceMovesLocked logs a migration.apply span for every session p moves
+// to a newer epoch: this gateway has fenced the old epoch and set the
+// session's forwarding and return routes for its new path. A session
+// seen for the first time is not a move. When polls are far apart, a
+// gateway can see a session jump several epochs; the span then belongs
+// to the newest one.
+func (a *Agent) traceMovesLocked(p Plan, began time.Time, vipErrs map[netip.Addr]error) {
+	for id, now := range p.Sessions {
+		was, seen := a.applied[id]
+		a.applied[id] = now
+		if !seen || now.Epoch <= was.Epoch {
+			continue
+		}
+		forward, ret := a.forward[now.VirtualIP], a.ret[now.VirtualIP]
+		a.cfg.Tracer.StartAt(telemetry.WithMigration(context.Background(), id, now.Epoch), "migration.apply", began,
+			slog.String("access", now.Access), slog.String("egress", now.Egress),
+			slog.String("from_access", was.Access), slog.String("from_egress", was.Egress),
+			slog.Uint64("from_epoch", was.Epoch),
+			slog.String("forward_to", forward), slog.String("return_via", ret),
+		).End(vipErrs[now.VirtualIP])
+	}
 }
 
 func (a *Agent) applyBackboneLocked(id string, want Backbone) error {

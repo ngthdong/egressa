@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"strings"
@@ -88,5 +90,65 @@ func TestMetrics_MigrationsAndRoutes(t *testing.T) {
 	}
 	if strings.Contains(body, id) || strings.Contains(body, secret) {
 		t.Error("a session ID or secret reached the metrics")
+	}
+}
+
+func TestTrace_MigrateSpans(t *testing.T) {
+	var buf bytes.Buffer
+	l, err := telemetry.NewLogger(telemetry.LogConfig{Writer: &buf, Format: telemetry.FormatJSON, Role: "controller", Version: "dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(context.Background(), Config{
+		Store: control.NewMemStore(), GatewayToken: "gw-token", ClientToken: "cl-token",
+		Network: testNetwork, Logger: l, Tracer: telemetry.NewTracer(l, nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := httptest.NewServer(srv.Handler())
+	defer hs.Close()
+	gw, _ := api.NewClient(hs.URL, "gw-token")
+	cl, _ := api.NewClient(hs.URL, "cl-token")
+	e := &testEnv{srv: srv, gw: gw, cl: cl, url: hs.URL}
+	ctx := context.Background()
+	e.register(t, "hk", both, "192.0.2.11:51820")
+	e.register(t, "sg", both, "192.0.2.12:51820")
+	resp, err := cl.CreateSession(ctx, api.CreateSessionRequest{PublicKey: pubKey(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := resp.Session.ID
+	_, _ = cl.Migrate(ctx, id, resp.Secret, api.MigrateRequest{Epoch: 1, Access: "sg", Egress: "hk"})   // ok -> epoch 2
+	_, _ = cl.Migrate(ctx, id, resp.Secret, api.MigrateRequest{Epoch: 1, Access: "hk", Egress: "hk"})   // loses: targets 2
+	_, _ = cl.Migrate(ctx, id, resp.Secret, api.MigrateRequest{Epoch: 2, Access: "nope", Egress: "hk"}) // rejected: targets 3
+
+	var spans []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("not JSON: %q", line)
+		}
+		if m["span"] == "migration.cas" {
+			spans = append(spans, m)
+		}
+	}
+	if len(spans) != 3 {
+		t.Fatalf("%d migration.cas spans, want 3:\n%s", len(spans), buf.String())
+	}
+	for i, want := range []struct {
+		status string
+		trace  string
+	}{
+		{"ok", telemetry.MigrationTraceID(id, 2)},
+		{"conflict", telemetry.MigrationTraceID(id, 2)}, // the losing attempt joins the trace it aimed at
+		{"error", telemetry.MigrationTraceID(id, 3)},
+	} {
+		if spans[i]["status"] != want.status || spans[i]["trace_id"] != want.trace || spans[i]["session"] != id {
+			t.Errorf("span %d: %v, want status %s trace %s", i, spans[i], want.status, want.trace)
+		}
+	}
+	if strings.Contains(buf.String(), resp.Secret) || strings.Contains(buf.String(), "cl-token") || strings.Contains(buf.String(), "gw-token") {
+		t.Error("a secret or token reached the logs")
 	}
 }

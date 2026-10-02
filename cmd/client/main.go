@@ -98,6 +98,7 @@ func main() {
 		FullTunnel: *fullTunnel,
 		Logger:     logger,
 		Metrics:    telemetry.NewClientMetrics(reg),
+		Tracer:     telemetry.NewTracer(logger, nil),
 	})
 	if err != nil {
 		cliutil.Fatal(logger, "bad configuration", err)

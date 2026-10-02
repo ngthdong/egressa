@@ -87,7 +87,7 @@ func main() {
 	agent, err := gateway.New(gateway.Config{
 		ID: *id, Controller: ctl, Roles: roles, Key: key,
 		ListenPort: uint16(*listenPort), Endpoint: *endpoint, Uplink: *uplink, MTU: *mtu,
-		Logger: logger, Metrics: telemetry.NewGatewayMetrics(reg),
+		Logger: logger, Metrics: telemetry.NewGatewayMetrics(reg), Tracer: telemetry.NewTracer(logger, nil),
 	})
 	if err != nil {
 		cliutil.Fatal(logger, "bad configuration", err)

@@ -57,6 +57,8 @@ type Config struct {
 	Logger *slog.Logger
 	// Metrics, if set, receives the controller's metrics.
 	Metrics *telemetry.ControllerMetrics
+	// Tracer, if set, logs a span for each migration request.
+	Tracer *telemetry.Tracer
 }
 
 type clientRecord struct {
@@ -710,36 +712,45 @@ func (s *Server) clientState(w http.ResponseWriter, r *http.Request, c clientRec
 func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord) {
 	var req api.MigrateRequest
 	if !decode(w, r, &req) {
+		// No epoch, so no trace to join this to.
 		s.cfg.Metrics.Migration(telemetry.MigrationRejected)
 		return
 	}
-	ctx := r.Context()
+	// The trace of the epoch the client targets: the same ID the client
+	// and the gateways compute, also when the request loses to a
+	// conflict (then the session's current epoch is ahead of req.Epoch).
+	ctx := telemetry.WithMigration(r.Context(), c.ID, req.Epoch+1)
+	span := s.cfg.Tracer.Start(ctx, "migration.cas", slog.String("access", req.Access), slog.String("egress", req.Egress))
+	fail := func(result string, code int, format string, args ...any) {
+		s.cfg.Metrics.Migration(result)
+		err := fmt.Errorf(format, args...)
+		span.EndStatus(telemetry.StatusError, err)
+		writeErr(w, code, "%v", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	gws, err := s.gateways(ctx)
 	if err != nil {
-		s.cfg.Metrics.Migration(telemetry.MigrationError)
-		writeErr(w, http.StatusInternalServerError, "%v", err)
+		fail(telemetry.MigrationError, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if g, ok := api.FindGateway(gws, req.Access); !ok || !g.Roles.Has(control.RoleAccess) {
-		s.cfg.Metrics.Migration(telemetry.MigrationRejected)
-		writeErr(w, http.StatusBadRequest, "no access gateway %q", req.Access)
+		fail(telemetry.MigrationRejected, http.StatusBadRequest, "no access gateway %q", req.Access)
 		return
 	}
 	if g, ok := api.FindGateway(gws, req.Egress); !ok || !g.Roles.Has(control.RoleEgress) {
-		s.cfg.Metrics.Migration(telemetry.MigrationRejected)
-		writeErr(w, http.StatusBadRequest, "no egress gateway %q", req.Egress)
+		fail(telemetry.MigrationRejected, http.StatusBadRequest, "no egress gateway %q", req.Egress)
 		return
 	}
 	cur, err := s.session(ctx, c)
 	if err != nil {
-		s.cfg.Metrics.Migration(telemetry.MigrationError)
-		writeErr(w, http.StatusInternalServerError, "%v", err)
+		fail(telemetry.MigrationError, http.StatusInternalServerError, "%v", err)
 		return
 	}
+	span.SetAttrs(slog.Uint64("current_epoch", cur.Epoch))
 	conflict := func(sess api.Session) {
 		s.cfg.Metrics.Migration(telemetry.MigrationConflict)
+		span.EndStatus(telemetry.StatusConflict, fmt.Errorf("the session is at epoch %d, not %d", sess.Epoch, req.Epoch))
 		writeJSON(w, http.StatusConflict, api.Error{Error: "the session is at another epoch", Session: &sess})
 	}
 	if req.Epoch != cur.Epoch {
@@ -749,8 +760,7 @@ func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord)
 	next := control.OwnershipRecord{Session: c.ID, Access: req.Access, Egress: req.Egress, Epoch: cur.Epoch + 1}
 	applied, err := s.ownership.SetIfNewer(ctx, next)
 	if err != nil {
-		s.cfg.Metrics.Migration(telemetry.MigrationError)
-		writeErr(w, http.StatusInternalServerError, "%v", err)
+		fail(telemetry.MigrationError, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if !applied {
@@ -760,12 +770,14 @@ func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord)
 			return
 		}
 		s.cfg.Metrics.Migration(telemetry.MigrationConflict)
+		span.EndStatus(telemetry.StatusConflict, errors.New("the session moved concurrently"))
 		writeErr(w, http.StatusConflict, "the session moved concurrently")
 		return
 	}
 	s.bumpLocked()
 	s.cfg.Metrics.Migration(telemetry.MigrationCommitted)
-	s.log.InfoContext(telemetry.WithMigration(ctx, c.ID, next.Epoch), "session migrated",
+	span.End(nil)
+	s.log.InfoContext(ctx, "session migrated",
 		"access", next.Access, "egress", next.Egress, "from_access", cur.Access, "from_egress", cur.Egress)
 	cur.Access, cur.Egress, cur.Epoch = next.Access, next.Egress, next.Epoch
 	writeJSON(w, http.StatusOK, cur)

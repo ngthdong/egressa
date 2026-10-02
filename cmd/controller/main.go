@@ -143,7 +143,7 @@ func run(o options, logger *slog.Logger) error {
 	srv, err := controller.New(ctx, controller.Config{
 		Store: store, GatewayToken: gwToken, ClientToken: clToken, Policy: policy,
 		Network: api.Network{ClientSubnet: cs, NodeSubnet: ns, ProbePort: uint16(o.probePort)},
-		Logger:  logger, Metrics: telemetry.NewControllerMetrics(reg),
+		Logger:  logger, Metrics: telemetry.NewControllerMetrics(reg), Tracer: telemetry.NewTracer(logger, nil),
 	})
 	if err != nil {
 		return err

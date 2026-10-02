@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/netip"
@@ -16,12 +16,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ngthdong/egressa/internal/api"
 	"github.com/ngthdong/egressa/internal/control"
 	"github.com/ngthdong/egressa/internal/measurement"
 	"github.com/ngthdong/egressa/internal/pathmon"
+	"github.com/ngthdong/egressa/internal/telemetry"
 	"github.com/ngthdong/egressa/internal/tunnel"
 )
 
@@ -52,17 +54,37 @@ type Config struct {
 	MTU        int
 	DeadAfter  time.Duration
 	Probe      pathmon.Config
-	Logf       func(format string, args ...any)
+	// Logger receives the agent's logs; nil means slog.Default().
+	Logger *slog.Logger
+	// Metrics, if set, receives the agent's metrics.
+	Metrics *telemetry.ClientMetrics
+	// Tracer, if set, logs a span for each phase of a migration.
+	Tracer *telemetry.Tracer
+}
+
+// pendingMigration is a move the client has decided on and asked the
+// controller to commit. Whichever path brings the new epoch in first (the
+// controller's answer, or the state long poll) credits it to the cause.
+type pendingMigration struct {
+	toEpoch uint64
+	cause   string
+	start   time.Time
 }
 
 // Agent runs one client.
 type Agent struct {
-	cfg    Config
-	key    tunnel.KeyPair
-	secret string
-	dev    *tunnel.RealDevice
-	mon    *pathmon.Monitor
-	start  time.Time
+	cfg Config
+	log *slog.Logger
+	key tunnel.KeyPair
+	// sessionID is set once, when the session opens, and never changes.
+	sessionID string
+	secret    string
+	dev       *tunnel.RealDevice
+	mon       *pathmon.Monitor
+	start     time.Time
+	// controllerUp is whether the last request to the controller got an
+	// answer.
+	controllerUp atomic.Bool
 
 	mu       sync.Mutex
 	session  api.Session
@@ -75,6 +97,7 @@ type Agent struct {
 	since    time.Time // when the current path became current
 	original tunnel.RouteInfo
 	hadRoute bool
+	pending  *pendingMigration
 }
 
 // New checks cfg and returns an Agent ready to Run.
@@ -91,13 +114,17 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Probe.Budget == nil {
 		cfg.Probe = pathmon.DefaultConfig()
 	}
-	if cfg.Logf == nil {
-		cfg.Logf = log.Printf
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
-	return &Agent{cfg: cfg, links: make(map[[2]string]api.Link), peers: make(map[string]api.Gateway), bypass: make(map[netip.Addr]bool)}, nil
+	return &Agent{cfg: cfg, log: cfg.Logger, links: make(map[[2]string]api.Link), peers: make(map[string]api.Gateway), bypass: make(map[netip.Addr]bool)}, nil
 }
 
-func (a *Agent) logf(format string, args ...any) { a.cfg.Logf("client: "+format, args...) }
+// logCtx carries the session, so every log record about it has its
+// session ID and trace ID.
+func (a *Agent) logCtx() context.Context {
+	return telemetry.WithSession(context.Background(), a.sessionID)
+}
 
 // Session returns the session as the client currently has it.
 func (a *Agent) Session() api.Session {
@@ -121,7 +148,7 @@ func (a *Agent) open(ctx context.Context) error {
 			if err := SaveState(a.cfg.StateFile, st); err != nil {
 				return err
 			}
-			a.secret = resp.Secret
+			a.secret, a.sessionID = resp.Secret, resp.Session.ID
 			a.session, a.network = resp.Session, resp.Network
 			return nil
 		}
@@ -129,7 +156,7 @@ func (a *Agent) open(ctx context.Context) error {
 		if errors.As(err, &se) && se.Code/100 == 4 {
 			return fmt.Errorf("client: the controller refused the session: %w", err)
 		}
-		a.logf("open session: %v (retrying)", err)
+		a.log.Warn("open session failed; retrying", telemetry.Err(err))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -148,12 +175,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("client: read state: %w", err)
 	}
+	a.controllerUp.Store(true)
 	sessionID, err := strconv.ParseUint(a.session.ID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("client: session ID %q: %w", a.session.ID, err)
 	}
-	a.logf("session %s: virtual IP %s, access %s, egress %s, epoch %d",
-		a.session.ID, a.session.VirtualIP, a.session.Access, a.session.Egress, a.session.Epoch)
+	a.log.InfoContext(a.logCtx(), "session opened", "virtual_ip", a.session.VirtualIP.String(),
+		"access", a.session.Access, "egress", a.session.Egress, "epoch", a.session.Epoch)
 
 	dev, err := tunnel.NewReal(tunnel.RealConfig{
 		PrivateKey: a.key.Private, InterfaceName: a.cfg.Interface, MTU: a.cfg.MTU,
@@ -201,7 +229,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			return err
 		}
 		defer a.restoreRoutes()
-		a.logf("full tunnel: all traffic now goes through %s", dev.Name())
+		a.log.Info("full tunnel on: all traffic goes through the VPN", "interface", dev.Name())
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -212,7 +240,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); _ = a.mon.Run(runCtx) }()
 	go func() { defer wg.Done(); a.pollLoop(runCtx, st.Version) }()
 
-	a.logf("ready")
+	a.log.InfoContext(a.logCtx(), "ready")
 	tick := time.NewTicker(decideInterval)
 	defer tick.Stop()
 	status := time.NewTicker(statusInterval)
@@ -242,7 +270,7 @@ func (a *Agent) restoreRoutes() {
 		err = errors.Join(err, tunnel.RemoveBypassRoute(h))
 	}
 	if err != nil {
-		a.logf("WARNING: restoring routes: %v", err)
+		a.log.Warn("restoring routes failed", telemetry.Err(err))
 	}
 }
 
@@ -257,12 +285,12 @@ func (a *Agent) addBypass(host netip.Addr) {
 		via = r
 	}
 	if via.Interface == "" {
-		a.logf("WARNING: no route to %s outside the tunnel", host)
+		a.log.Warn("no route outside the tunnel", "host", host.String())
 		return
 	}
 	_ = tunnel.RemoveBypassRoute(host)
 	if err := tunnel.AddBypassRoute(host, via); err != nil {
-		a.logf("WARNING: bypass route to %s: %v", host, err)
+		a.log.Warn("bypass route failed", "host", host.String(), telemetry.Err(err))
 		return
 	}
 	a.bypass[host] = true
@@ -270,12 +298,13 @@ func (a *Agent) addBypass(host netip.Addr) {
 
 func (a *Agent) pollLoop(ctx context.Context, version uint64) {
 	for {
-		st, err := a.cfg.Controller.ClientState(ctx, a.session.ID, a.secret, version, statePollWait)
+		st, err := a.cfg.Controller.ClientState(ctx, a.sessionID, a.secret, version, statePollWait)
+		a.noteController(err)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			a.logf("controller: %v", err)
+			a.log.Warn("controller unreachable", telemetry.Err(err))
 			select {
 			case <-ctx.Done():
 				return
@@ -312,14 +341,14 @@ func (a *Agent) update(st api.ClientState) {
 			a.addBypass(host)
 		}
 		if err := a.configurePeerLocked(g, g.ID == a.session.Access); err != nil {
-			a.logf("peer %s: %v", g.ID, err)
+			a.log.Warn("configure peer failed", "gateway", g.ID, telemetry.Err(err))
 			continue
 		}
 		a.peers[g.ID] = g
 	}
 	a.mu.Unlock()
 	if err := a.mon.Set(targets); err != nil {
-		a.logf("probe targets: %v", err)
+		a.log.Warn("set probe targets failed", telemetry.Err(err))
 	}
 	// Someone else moved the session (or a migration's answer was lost).
 	a.adopt(st.Session)
@@ -349,14 +378,21 @@ func (a *Agent) adopt(sess api.Session) {
 		return
 	}
 	old := a.session
+	mctx := telemetry.WithMigration(context.Background(), sess.ID, sess.Epoch)
+	span := a.cfg.Tracer.Start(mctx, "migration.switch",
+		slog.String("access", sess.Access), slog.String("egress", sess.Egress),
+		slog.String("from_access", old.Access), slog.String("from_egress", old.Egress))
+	var switchErr error
 	// The epoch first: the new access may already fence older epochs.
 	a.dev.SetEpoch(uint32(sess.Epoch))
 	if sess.Access != old.Access {
 		g, ok := api.FindGateway(a.gateways, sess.Access)
 		if !ok {
-			a.logf("WARNING: new access gateway %s is unknown", sess.Access)
+			switchErr = fmt.Errorf("new access gateway %s is unknown", sess.Access)
+			a.log.Warn("new access gateway is unknown", "access", sess.Access)
 		} else if err := a.configurePeerLocked(g, true); err != nil {
-			a.logf("WARNING: switch to %s: %v", sess.Access, err)
+			switchErr = err
+			a.log.Warn("switching the active peer failed", "access", sess.Access, telemetry.Err(err))
 		} else {
 			a.peers[g.ID] = g
 		}
@@ -365,8 +401,21 @@ func (a *Agent) adopt(sess api.Session) {
 	now := time.Now()
 	a.since = now
 	a.decider.Reset(now)
-	a.logf("now on access %s, egress %s (epoch %d; was access %s, egress %s)",
-		sess.Access, sess.Egress, sess.Epoch, old.Access, old.Egress)
+	// Credit the move to the client's own decision if it is the one the
+	// client asked for, else to whoever else moved the session.
+	cause, began := telemetry.CauseExternal, time.Time{}
+	if p := a.pending; p != nil && p.toEpoch == sess.Epoch {
+		cause, began = p.cause, p.start
+	}
+	a.pending = nil
+	a.cfg.Metrics.Migration(cause, telemetry.ResultCommitted)
+	if !began.IsZero() {
+		a.cfg.Metrics.MigrationDuration(cause, now.Sub(began))
+	}
+	span.SetAttrs(slog.String("cause", cause))
+	span.End(switchErr)
+	a.log.InfoContext(telemetry.WithMigration(context.Background(), sess.ID, sess.Epoch), "path changed",
+		"access", sess.Access, "egress", sess.Egress, "from_access", old.Access, "from_egress", old.Egress)
 }
 
 // paths builds every path the client could use: through each access
@@ -417,51 +466,131 @@ func (a *Agent) paths(now time.Time) (paths []Path, currentDead bool) {
 }
 
 func (a *Agent) decideOnce(ctx context.Context) {
+	began := a.cfg.Tracer.Now()
 	now := time.Now()
 	paths, dead := a.paths(now)
 	a.mu.Lock()
 	sess := a.session
 	dec := a.decider.Decide(now, sess.Access, sess.Egress, paths, dead)
+	if dec.Migrate {
+		a.pending = &pendingMigration{toEpoch: sess.Epoch + 1, cause: dec.Cause, start: now}
+	}
+	accessIDs := make([]string, 0, len(a.gateways))
+	for _, g := range a.gateways {
+		if g.Roles.Has(control.RoleAccess) {
+			accessIDs = append(accessIDs, g.ID)
+		}
+	}
 	a.mu.Unlock()
+	a.cfg.Metrics.Decision(dec.Outcome)
+	a.publish(sess, accessIDs, paths, dead, dec)
 	if !dec.Migrate {
 		return
 	}
-	a.logf("migrating: %s", dec.Reason)
+	// Every span of this move, in every process, shares the trace ID of
+	// the epoch it targets, even if the move loses to a conflict.
+	mctx := telemetry.WithMigration(context.Background(), sess.ID, sess.Epoch+1)
+	target := []slog.Attr{slog.String("access", dec.Access), slog.String("egress", dec.Egress)}
+	a.cfg.Tracer.StartAt(mctx, "migration.decide", began, append(target,
+		slog.String("cause", dec.Cause), slog.String("from_access", sess.Access), slog.String("from_egress", sess.Egress),
+		slog.String("reason", dec.Reason))...).End(nil)
+	a.log.InfoContext(a.logCtx(), "migrating", "access", dec.Access, "egress", dec.Egress, "reason", dec.Reason)
+	commit := a.cfg.Tracer.Start(mctx, "migration.commit", target...)
 	next, err := a.cfg.Controller.Migrate(ctx, sess.ID, a.secret, api.MigrateRequest{Epoch: sess.Epoch, Access: dec.Access, Egress: dec.Egress})
+	a.noteController(err)
 	var conflict *api.ConflictError
 	switch {
 	case errors.As(err, &conflict):
-		a.logf("migration lost to epoch %d", conflict.Current.Epoch)
+		commit.SetAttrs(slog.Uint64("now_epoch", conflict.Current.Epoch))
+		commit.EndStatus(telemetry.StatusConflict, err)
+		a.log.InfoContext(a.logCtx(), "migration lost to a newer epoch", "now_epoch", conflict.Current.Epoch)
+		a.cfg.Metrics.Migration(dec.Cause, telemetry.ResultConflict)
+		a.clearPending()
 		a.adopt(conflict.Current)
 	case err != nil:
-		a.logf("migration failed, staying: %v", err)
+		commit.End(err)
+		a.log.WarnContext(a.logCtx(), "migration failed; staying", telemetry.Err(err))
+		a.cfg.Metrics.Migration(dec.Cause, telemetry.ResultFailed)
+		a.clearPending()
 	default:
+		commit.End(nil)
 		a.adopt(next)
 	}
+}
+
+func (a *Agent) clearPending() {
+	a.mu.Lock()
+	a.pending = nil
+	a.mu.Unlock()
+}
+
+// noteController records whether a request reached the controller: any
+// answer from it, an error status included, means it is up.
+func (a *Agent) noteController(err error) {
+	var se *api.StatusError
+	var ce *api.ConflictError
+	a.controllerUp.Store(err == nil || errors.As(err, &se) || errors.As(err, &ce))
+}
+
+// publish hands the decision pass's numbers to the metrics.
+func (a *Agent) publish(sess api.Session, accessIDs []string, paths []Path, dead bool, dec Decision) {
+	if a.cfg.Metrics == nil {
+		return
+	}
+	snap := telemetry.ClientSnapshot{
+		ThresholdMicros: dec.Threshold,
+		ActiveAccess:    sess.Access, ActiveEgress: sess.Egress,
+		Epoch: sess.Epoch, CurrentDead: dead, ControllerUp: a.controllerUp.Load(),
+	}
+	for _, id := range accessIDs {
+		st, _, ok := a.mon.Stats(id)
+		if !ok {
+			continue
+		}
+		snap.Segments = append(snap.Segments, telemetry.SegmentSample{
+			Gateway: id, P50Micros: st.P50Micros, P95Micros: st.P95Micros,
+			LossRatio: st.LossRate, Confidence: st.Confidence, Samples: st.N,
+		})
+	}
+	for i, p := range paths {
+		ps := telemetry.PathSample{Access: p.Access, Egress: p.Egress, Reachable: p.Reachable}
+		measured := true
+		for _, seg := range p.Segments {
+			measured = measured && seg.N > 0
+		}
+		if i < len(dec.Evals) {
+			ev := dec.Evals[i]
+			ps.CostMicros = ev.Cost
+			ps.Usable = measured && !math.IsInf(ev.Cost, 0)
+			ps.DeltaLowerMicros, ps.HasDelta = ev.Delta.Lower, ev.HasDelta
+		}
+		snap.Paths = append(snap.Paths, ps)
+	}
+	a.cfg.Metrics.SetSnapshot(snap)
 }
 
 func (a *Agent) logStatus() {
 	now := time.Now()
 	paths, dead := a.paths(now)
 	sess := a.Session()
-	line := fmt.Sprintf("access %s, egress %s, epoch %d", sess.Access, sess.Egress, sess.Epoch)
-	if dead {
-		line += " (current path not answering)"
-	}
 	a.mu.Lock()
 	pol := a.decider.Policy()
 	a.mu.Unlock()
+	var costs, unreachable []any
 	for _, p := range paths {
 		if p.Egress != sess.Egress {
 			continue
 		}
-		c := measurement.ScorePath(p.candidate(), pol.Cost).Cost
-		line += fmt.Sprintf("; via %s: %.1f ms", p.Access, c/1000)
+		if c := measurement.ScorePath(p.candidate(), pol.Cost).Cost; !math.IsInf(c, 0) {
+			costs = append(costs, slog.Float64(p.Access, c/1000))
+		}
 		if !p.Reachable {
-			line += " (unreachable)"
+			unreachable = append(unreachable, p.Access)
 		}
 	}
-	a.logf("%s", line)
+	a.log.InfoContext(telemetry.WithSession(context.Background(), sess.ID), "status",
+		"access", sess.Access, "egress", sess.Egress, "epoch", sess.Epoch, "current_dead", dead,
+		slog.Group("cost_ms", costs...), "unreachable", unreachable)
 }
 
 func ipCmd(args ...string) error {

@@ -14,6 +14,7 @@ import (
 	"github.com/ngthdong/egressa/internal/api"
 	"github.com/ngthdong/egressa/internal/control"
 	"github.com/ngthdong/egressa/internal/measurement"
+	"github.com/ngthdong/egressa/internal/telemetry"
 	"github.com/ngthdong/egressa/internal/tunnel"
 )
 
@@ -36,7 +37,7 @@ func newEnv(t *testing.T, store control.KVStore) *testEnv {
 	}
 	srv, err := New(context.Background(), Config{
 		Store: store, GatewayToken: "gw-token", ClientToken: "cl-token",
-		Network: testNetwork, Logf: t.Logf,
+		Network: testNetwork, Logger: telemetry.Discard(),
 	})
 	if err != nil {
 		t.Fatal(err)

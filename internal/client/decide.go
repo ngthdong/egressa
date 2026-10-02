@@ -8,6 +8,7 @@ import (
 	"github.com/ngthdong/egressa/internal/control"
 	"github.com/ngthdong/egressa/internal/handoff"
 	"github.com/ngthdong/egressa/internal/measurement"
+	"github.com/ngthdong/egressa/internal/telemetry"
 )
 
 // Path is one way to carry the session: in through Access, out through
@@ -28,12 +29,37 @@ func (p Path) candidate() measurement.PathCandidate {
 	return measurement.PathCandidate{EgressID: p.Egress, Segments: p.Segments}
 }
 
-// Decision is what Decider.Decide concluded.
+// Decision is what Decider.Decide concluded. Migrate, Access, Egress and
+// Reason are the decision; the other fields only report how it was
+// reached, for metrics.
 type Decision struct {
 	Migrate bool
 	Access  string
 	Egress  string
 	Reason  string
+
+	// Outcome is telemetry.OutcomeStay, OutcomeConfirming, OutcomeMigrate
+	// or OutcomeNoAlternative; Cause, set when Migrate is, is
+	// telemetry.CauseBetterPath, CauseAccessDead or CauseEgressChange.
+	Outcome string
+	Cause   string
+	// Threshold is the improvement, in microseconds, a migration must
+	// clear: MigrationCost + SafetyMargin.
+	Threshold float64
+	// Evals scores every path this decision looked at.
+	Evals []PathEval
+}
+
+// PathEval is one path as a decision scored it.
+type PathEval struct {
+	Access, Egress string
+	// Cost is measurement.ScorePath's cost, in microseconds; +Inf when
+	// the path is gated.
+	Cost float64
+	// Delta is measurement.DecideMigration's estimate of Cost(current) -
+	// Cost(this path), when the decision computed one (HasDelta).
+	Delta    measurement.DeltaEstimate
+	HasDelta bool
 }
 
 // Decider chooses when to move the session to another path. Between
@@ -82,17 +108,42 @@ func (d *Decider) cheapest(paths []Path, keep func(Path) bool) (Path, bool) {
 // Decide looks at every known path once. currentDead says the current
 // path has stopped answering.
 func (d *Decider) Decide(now time.Time, access, egress string, paths []Path, currentDead bool) Decision {
+	dec := d.decide(now, access, egress, paths, currentDead)
+	dec.Threshold = d.policy.Decision.MigrationCost + d.policy.Decision.SafetyMargin
+	if dec.Outcome == "" {
+		dec.Outcome = telemetry.OutcomeStay
+	}
+	if dec.Migrate {
+		dec.Outcome = telemetry.OutcomeMigrate
+	}
+	return dec
+}
+
+// evals scores every path; decide fills in the deltas it computes.
+func (d *Decider) evals(paths []Path) []PathEval {
+	out := make([]PathEval, len(paths))
+	for i, p := range paths {
+		out[i] = PathEval{Access: p.Access, Egress: p.Egress, Cost: d.cost(p)}
+	}
+	return out
+}
+
+func (d *Decider) decide(now time.Time, access, egress string, paths []Path, currentDead bool) Decision {
+	evals := d.evals(paths)
 	other := func(p Path) bool { return p.Egress == egress && p.Access != access }
 	if currentDead {
 		if p, ok := d.cheapest(paths, other); ok && handoff.ShouldCutover(d.flap, true, now, true, p.Access) {
 			return Decision{Migrate: true, Access: p.Access, Egress: p.Egress,
-				Reason: fmt.Sprintf("access %s stopped answering", access)}
+				Reason: fmt.Sprintf("access %s stopped answering", access),
+				Cause:  telemetry.CauseAccessDead, Evals: evals}
 		}
 		if p, ok := d.cheapest(paths, func(p Path) bool { return p.Egress != egress }); ok {
 			return Decision{Migrate: true, Access: p.Access, Egress: p.Egress,
-				Reason: fmt.Sprintf("no path to egress %s works; changing egress (open connections will break)", egress)}
+				Reason: fmt.Sprintf("no path to egress %s works; changing egress (open connections will break)", egress),
+				Cause:  telemetry.CauseEgressChange, Evals: evals}
 		}
-		return Decision{Reason: "the current path is dead and no other path answers"}
+		return Decision{Reason: "the current path is dead and no other path answers",
+			Outcome: telemetry.OutcomeNoAlternative, Evals: evals}
 	}
 
 	var current Path
@@ -105,7 +156,7 @@ func (d *Decider) Decide(now time.Time, access, egress string, paths []Path, cur
 	}
 	if !haveCurrent {
 		d.flap.Evaluate(now, false, "")
-		return Decision{Reason: "the current path is not measured yet"}
+		return Decision{Reason: "the current path is not measured yet", Evals: evals}
 	}
 
 	// Of the candidates that clear the bar, the one surest to be better:
@@ -113,7 +164,7 @@ func (d *Decider) Decide(now time.Time, access, egress string, paths []Path, cur
 	var best Path
 	var bestDec measurement.MigrationDecision
 	found := false
-	for _, p := range paths {
+	for i, p := range paths {
 		if !p.Reachable || !other(p) {
 			continue
 		}
@@ -121,19 +172,26 @@ func (d *Decider) Decide(now time.Time, access, egress string, paths []Path, cur
 		if err != nil {
 			continue
 		}
+		evals[i].Delta, evals[i].HasDelta = dec.Delta, true
 		if !found || dec.Delta.Lower > bestDec.Delta.Lower {
 			best, bestDec, found = p, dec, true
 		}
 	}
-	if !found || !bestDec.Migrate {
+	if !found {
 		d.flap.Evaluate(now, false, "")
-		return Decision{}
+		return Decision{Outcome: telemetry.OutcomeNoAlternative, Evals: evals}
+	}
+	if !bestDec.Migrate {
+		d.flap.Evaluate(now, false, "")
+		return Decision{Evals: evals}
 	}
 	if !handoff.ShouldCutover(d.flap, false, now, true, best.Access) {
-		return Decision{Reason: fmt.Sprintf("%s looks better; confirming", best.Access)}
+		return Decision{Reason: fmt.Sprintf("%s looks better; confirming", best.Access),
+			Outcome: telemetry.OutcomeConfirming, Evals: evals}
 	}
 	return Decision{
 		Migrate: true, Access: best.Access, Egress: best.Egress,
 		Reason: fmt.Sprintf("path via %s is better by at least %.1f ms (95%% bound)", best.Access, bestDec.Delta.Lower/1000),
+		Cause:  telemetry.CauseBetterPath, Evals: evals,
 	}
 }

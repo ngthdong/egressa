@@ -4,18 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/netip"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ngthdong/egressa/internal/api"
 	"github.com/ngthdong/egressa/internal/control"
 	"github.com/ngthdong/egressa/internal/pathmon"
+	"github.com/ngthdong/egressa/internal/telemetry"
 	"github.com/ngthdong/egressa/internal/tunnel"
 	"github.com/ngthdong/egressa/pkg/wire"
 )
@@ -48,7 +50,12 @@ type Config struct {
 	// Probe configures backbone probing; the zero value means
 	// pathmon.DefaultConfig().
 	Probe pathmon.Config
-	Logf  func(format string, args ...any)
+	// Logger receives the agent's logs; nil means slog.Default().
+	Logger *slog.Logger
+	// Metrics, if set, receives the agent's metrics.
+	Metrics *telemetry.GatewayMetrics
+	// Tracer, if set, logs a span each time a session's move is applied.
+	Tracer *telemetry.Tracer
 }
 
 type backbone struct {
@@ -62,12 +69,18 @@ type backbone struct {
 // Agent runs one gateway.
 type Agent struct {
 	cfg     Config
+	log     *slog.Logger
 	nodeIP  netip.Addr
 	network api.Network
 	gate    *control.EpochGate
-	egc     *tunnel.RealDevice
-	mon     *pathmon.Monitor
-	undo    []func()
+	// fence is what admit reads on every packet: session ID -> the
+	// lowest epoch admitted, copied from gate after each change. A plain
+	// map of integers behind an atomic pointer, so the packet path never
+	// formats a session ID or takes a lock.
+	fence atomic.Pointer[map[uint64]uint64]
+	egc   *tunnel.RealDevice
+	mon   *pathmon.Monitor
+	undo  []func()
 
 	mu        sync.Mutex
 	index     map[string]int // gateway ID -> n, for egb<n> and its table
@@ -77,6 +90,17 @@ type Agent struct {
 	forward   map[netip.Addr]string
 	ret       map[netip.Addr]string
 	ports     map[string]uint16 // backbone ports as last registered
+	// fenced holds every session ID ever applied, parsed, so the fence
+	// map covers every session gate knows.
+	fenced map[string]uint64
+	// carried counts the sessions of the plan last applied, for metrics.
+	accessSessions, egressSessions int
+	// applied is each session's path as last applied, to tell which
+	// sessions a plan moves.
+	applied map[string]SessionPath
+
+	stateVersion atomic.Uint64
+	controllerUp atomic.Bool
 }
 
 // New checks cfg and returns an Agent ready to Run.
@@ -96,22 +120,23 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Probe.Budget == nil {
 		cfg.Probe = pathmon.DefaultConfig()
 	}
-	if cfg.Logf == nil {
-		cfg.Logf = log.Printf
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
-	return &Agent{
+	a := &Agent{
 		cfg:       cfg,
+		log:       cfg.Logger,
 		gate:      control.NewEpochGate(),
 		index:     make(map[string]int),
 		backbones: make(map[string]*backbone),
 		peers:     make(map[string]netip.Addr),
 		forward:   make(map[netip.Addr]string),
 		ret:       make(map[netip.Addr]string),
-	}, nil
-}
-
-func (a *Agent) logf(format string, args ...any) {
-	a.cfg.Logf("gateway %s: "+format, append([]any{a.cfg.ID}, args...)...)
+		fenced:    make(map[string]uint64),
+		applied:   make(map[string]SessionPath),
+	}
+	a.fence.Store(&map[uint64]uint64{})
+	return a, nil
 }
 
 // Run registers, configures the host, and follows the controller until
@@ -122,7 +147,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		return err
 	}
 	a.nodeIP, a.network = reg.NodeIP, reg.Network
-	a.logf("registered, node IP %s, client subnet %s", a.nodeIP, a.network.ClientSubnet)
+	a.log.Info("registered", "node_ip", a.nodeIP.String(), "client_subnet", a.network.ClientSubnet.String())
 	defer a.teardown()
 	if err := a.setup(); err != nil {
 		return err
@@ -136,15 +161,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); _ = a.mon.Run(runCtx) }()
 	go func() { defer wg.Done(); a.reportLoop(runCtx) }()
 
-	a.logf("ready")
+	a.log.Info("ready")
 	var version uint64
 	for {
 		st, err := a.cfg.Controller.GatewayState(runCtx, version, pollWait)
+		a.noteController(err)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			a.logf("controller: %v", err)
+			a.log.Warn("controller unreachable", telemetry.Err(err))
 			select {
 			case <-ctx.Done():
 				return nil
@@ -154,11 +180,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		version = st.Version
 		if err := a.apply(MakePlan(a.cfg.ID, a.cfg.Roles, st)); err != nil {
-			a.logf("apply: %v", err)
+			a.log.Warn("apply failed", telemetry.Err(err))
+			a.cfg.Metrics.ApplyError()
 		}
+		a.stateVersion.Store(st.Version)
+		a.publish()
 		if a.portsChanged() {
 			if _, err := a.register(runCtx); err != nil {
-				a.logf("re-register: %v", err)
+				a.log.Warn("re-register failed", telemetry.Err(err))
 			}
 		}
 	}
@@ -186,7 +215,7 @@ func (a *Agent) register(ctx context.Context) (api.RegisterGatewayResponse, erro
 	a.ports = ports
 	a.mu.Unlock()
 	if a.nodeIP.IsValid() && resp.NodeIP != a.nodeIP {
-		a.logf("WARNING: the controller now gives node IP %s, but this run uses %s; restart the gateway", resp.NodeIP, a.nodeIP)
+		a.log.Warn("the controller gives another node IP; restart the gateway", "node_ip", resp.NodeIP.String(), "in_use", a.nodeIP.String())
 	}
 	return resp, nil
 }
@@ -201,7 +230,7 @@ func (a *Agent) registerRetry(ctx context.Context) (api.RegisterGatewayResponse,
 		if errors.As(err, &se) && se.Code/100 == 4 {
 			return resp, fmt.Errorf("gateway: the controller refused registration: %w", err)
 		}
-		a.logf("register: %v (retrying)", err)
+		a.log.Warn("register failed; retrying", telemetry.Err(err))
 		select {
 		case <-ctx.Done():
 			return resp, ctx.Err()
@@ -227,12 +256,74 @@ func (a *Agent) portsChanged() bool {
 
 // admit fences a client packet stamped with an epoch older than its
 // session's current one: it is from before a migration this gateway has
-// already seen committed.
+// already seen committed. It runs for every packet, so it neither
+// allocates nor locks: it reads the fence map, a copy of gate's epochs
+// (an unknown session is admitted, as gate.Admit admits it).
 func (a *Agent) admit(h wire.SessionHeader) bool {
 	if h.SessionID == 0 {
 		return true
 	}
-	return a.gate.Admit(strconv.FormatUint(h.SessionID, 10), uint64(h.Epoch))
+	if known, ok := (*a.fence.Load())[h.SessionID]; ok && uint64(h.Epoch) < known {
+		a.cfg.Metrics.Fenced()
+		return false
+	}
+	return true
+}
+
+// updateFenceLocked copies gate's epoch of every session seen so far into
+// a new fence map.
+func (a *Agent) updateFenceLocked(epochs map[string]uint64) {
+	for session := range epochs {
+		if _, ok := a.fenced[session]; ok {
+			continue
+		}
+		if id, err := strconv.ParseUint(session, 10, 64); err == nil {
+			a.fenced[session] = id
+		}
+	}
+	next := make(map[uint64]uint64, len(a.fenced))
+	for session, id := range a.fenced {
+		if epoch, ok := a.gate.Known(session); ok {
+			next[id] = epoch
+		}
+	}
+	a.fence.Store(&next)
+}
+
+// noteController records whether a request reached the controller: any
+// answer from it, an error status included, means it is up.
+func (a *Agent) noteController(err error) {
+	var se *api.StatusError
+	a.controllerUp.Store(err == nil || errors.As(err, &se))
+}
+
+// publish hands the gateway's numbers to the metrics.
+func (a *Agent) publish() {
+	if a.cfg.Metrics == nil {
+		return
+	}
+	a.mu.Lock()
+	snap := telemetry.GatewaySnapshot{
+		AccessSessions: a.accessSessions, EgressSessions: a.egressSessions,
+		StateVersion: a.stateVersion.Load(), ControllerUp: a.controllerUp.Load(),
+	}
+	type peer struct {
+		id string
+		up bool
+	}
+	peers := make([]peer, 0, len(a.backbones))
+	for id, b := range a.backbones {
+		peers = append(peers, peer{id, b.up})
+	}
+	a.mu.Unlock()
+	for _, p := range peers {
+		bs := telemetry.BackboneSample{Peer: p.id, Up: p.up}
+		if st, _, ok := a.mon.Stats(p.id); ok {
+			bs.P50Micros, bs.P95Micros, bs.LossRatio, bs.Samples = st.P50Micros, st.P95Micros, st.LossRate, st.N
+		}
+		snap.Backbones = append(snap.Backbones, bs)
+	}
+	a.cfg.Metrics.SetSnapshot(snap)
 }
 
 func (a *Agent) setup() error {
@@ -318,7 +409,7 @@ func (a *Agent) teardown() {
 		a.undo[i]()
 	}
 	a.undo = nil
-	a.logf("stopped; host configuration removed")
+	a.log.Info("stopped; host configuration removed")
 }
 
 // indexLocked returns gateway id's n, giving it a new one on first use,
@@ -345,11 +436,15 @@ func (a *Agent) indexLocked(id string) (int, error) {
 func (a *Agent) apply(p Plan) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	began := a.cfg.Tracer.Now()
 	var errs []error
+	// vipErrs keeps each virtual IP's routing error for its session's span.
+	vipErrs := make(map[netip.Addr]error)
+	defer func() { a.traceMovesLocked(p, began, vipErrs) }()
 
 	for id, b := range a.backbones {
 		if _, ok := p.Backbones[id]; !ok {
-			a.logf("backbone to %s removed", id)
+			a.log.Info("backbone removed", "peer", id)
 			b.dev.Close()
 			delete(a.backbones, id)
 		}
@@ -394,6 +489,8 @@ func (a *Agent) apply(p Plan) error {
 	for session, epoch := range p.Epochs {
 		a.gate.Update(session, epoch)
 	}
+	a.updateFenceLocked(p.Epochs)
+	a.accessSessions, a.egressSessions = p.AccessSessions, p.EgressSessions
 
 	for vip, egress := range a.forward {
 		if p.Forward[vip] == egress {
@@ -401,6 +498,7 @@ func (a *Agent) apply(p Plan) error {
 		}
 		if err := delRule(ruleFrom(vip, egressTableBase+a.index[egress])); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 		}
 		delete(a.forward, vip)
 	}
@@ -411,10 +509,12 @@ func (a *Agent) apply(p Plan) error {
 		n, err := a.indexLocked(egress)
 		if err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 			continue
 		}
 		if err := addRule(ruleFrom(vip, egressTableBase+n)); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 			continue
 		}
 		a.forward[vip] = egress
@@ -426,6 +526,7 @@ func (a *Agent) apply(p Plan) error {
 		}
 		if err := ipIgnore("route", "del", netip.PrefixFrom(vip, 32).String()); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 		}
 		delete(a.ret, vip)
 	}
@@ -439,12 +540,36 @@ func (a *Agent) apply(p Plan) error {
 		}
 		if err := ip("route", "replace", netip.PrefixFrom(vip, 32).String(), "dev", b.name); err != nil {
 			errs = append(errs, err)
+			vipErrs[vip] = err
 			continue
 		}
-		a.logf("return traffic for %s now goes through %s", vip, access)
+		a.log.Info("return route changed", "virtual_ip", vip.String(), "access", access)
 		a.ret[vip] = access
 	}
 	return errors.Join(errs...)
+}
+
+// traceMovesLocked logs a migration.apply span for every session p moves
+// to a newer epoch: this gateway has fenced the old epoch and set the
+// session's forwarding and return routes for its new path. A session
+// seen for the first time is not a move. When polls are far apart, a
+// gateway can see a session jump several epochs; the span then belongs
+// to the newest one.
+func (a *Agent) traceMovesLocked(p Plan, began time.Time, vipErrs map[netip.Addr]error) {
+	for id, now := range p.Sessions {
+		was, seen := a.applied[id]
+		a.applied[id] = now
+		if !seen || now.Epoch <= was.Epoch {
+			continue
+		}
+		forward, ret := a.forward[now.VirtualIP], a.ret[now.VirtualIP]
+		a.cfg.Tracer.StartAt(telemetry.WithMigration(context.Background(), id, now.Epoch), "migration.apply", began,
+			slog.String("access", now.Access), slog.String("egress", now.Egress),
+			slog.String("from_access", was.Access), slog.String("from_egress", was.Egress),
+			slog.Uint64("from_epoch", was.Epoch),
+			slog.String("forward_to", forward), slog.String("return_via", ret),
+		).End(vipErrs[now.VirtualIP])
+	}
 }
 
 func (a *Agent) applyBackboneLocked(id string, want Backbone) error {
@@ -470,7 +595,7 @@ func (a *Agent) applyBackboneLocked(id string, want Backbone) error {
 		b = &backbone{dev: dev, name: name}
 		a.backbones[id] = b
 		port, _ := dev.ListenPort()
-		a.logf("backbone to %s on %s, listening on %d", id, name, port)
+		a.log.Info("backbone created", "peer", id, "device", name, "port", port)
 	}
 	if b.set && b.want == want {
 		return nil
@@ -506,7 +631,7 @@ func (a *Agent) applyBackboneLocked(id string, want Backbone) error {
 		return err
 	}
 	b.want, b.set = want, true
-	a.logf("backbone to %s: peer endpoint %q", id, want.Endpoint)
+	a.log.Info("backbone peer set", "peer", id, "endpoint", want.Endpoint, "initiator", initiator)
 	return nil
 }
 
@@ -527,7 +652,7 @@ func (a *Agent) setProbeTargetsLocked() error {
 		if last, err := b.dev.LastHandshake(key); err == nil && !last.IsZero() {
 			targets[id] = netip.AddrPortFrom(b.want.NodeIP, a.network.ProbePort)
 			if !b.up {
-				a.logf("backbone to %s is up", id)
+				a.log.Info("backbone up", "peer", id)
 				b.up = true
 			}
 		}
@@ -547,7 +672,7 @@ func (a *Agent) reportLoop(ctx context.Context) {
 		a.mu.Lock()
 		ids := slices.Collect(maps.Keys(a.backbones))
 		if err := a.setProbeTargetsLocked(); err != nil {
-			a.logf("probe targets: %v", err)
+			a.log.Warn("set probe targets failed", telemetry.Err(err))
 		}
 		a.mu.Unlock()
 		rep := api.LinkReport{Links: make([]api.Link, 0, len(ids))}
@@ -557,13 +682,20 @@ func (a *Agent) reportLoop(ctx context.Context) {
 			}
 		}
 		err := a.cfg.Controller.ReportLinks(ctx, a.cfg.ID, rep)
+		a.noteController(err)
+		if err == nil {
+			a.cfg.Metrics.LinkReport(telemetry.ReportOK)
+		} else {
+			a.cfg.Metrics.LinkReport(telemetry.ReportError)
+		}
 		var se *api.StatusError
 		if errors.As(err, &se) && se.Code == http.StatusNotFound {
 			// The controller lost its state; register again.
 			_, err = a.register(ctx)
 		}
 		if err != nil && ctx.Err() == nil {
-			a.logf("report: %v", err)
+			a.log.Warn("link report failed", telemetry.Err(err))
 		}
+		a.publish()
 	}
 }

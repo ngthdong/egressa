@@ -81,24 +81,27 @@ func TestManagedMigration(t *testing.T) {
 		"flap_guard": {"ConfirmationWindow": 2000000000, "MinResidence": 4000000000, "Cooldown": 2000000000}
 	}`)
 	ctlURL := "http://" + ctlAddr + ":8080"
-	start(t, dir, "controller", "", tokens, bin+"/controller", "--listen", ctlAddr+":8080", "--policy", policy)
+	start(t, dir, "controller", "", tokens, bin+"/controller", "--listen", ctlAddr+":8080", "--policy", policy,
+		"--log-format", "json", "--metrics-listen", ctlAddr+":9100")
 	waitHTTP(t, ctlURL+"/healthz")
 	for _, gw := range []struct{ id, wan string }{{"hk", hkWAN}, {"sg", sgWAN}} {
 		start(t, dir, "gateway-"+gw.id, gw.id, tokens, bin+"/gateway",
 			"--id", gw.id, "--controller", ctlURL, "--role", "access,egress",
 			"--endpoint", gw.wan+":51820", "--uplink", "inet0",
-			"--private-key-file", filepath.Join(dir, gw.id+".key"))
+			"--private-key-file", filepath.Join(dir, gw.id+".key"),
+			"--log-format", "json", "--metrics-listen", gw.wan+":9100")
 	}
-	waitLog(t, dir, "gateway-hk", "ready", 20*time.Second)
-	waitLog(t, dir, "gateway-sg", "ready", 20*time.Second)
+	waitLog(t, dir, "gateway-hk", `"msg":"ready"`, 20*time.Second)
+	waitLog(t, dir, "gateway-sg", `"msg":"ready"`, 20*time.Second)
 
 	stopEcho := runEchoServer(t)
 	defer stopEcho()
 
 	stateFile := filepath.Join(dir, "client.json")
 	start(t, dir, "client", "cli", tokens, bin+"/client",
-		"--controller", ctlURL, "--state-file", stateFile, "--egress", "hk", "--full-tunnel")
-	waitLog(t, dir, "client", "client: ready", 20*time.Second)
+		"--controller", ctlURL, "--state-file", stateFile, "--egress", "hk", "--full-tunnel",
+		"--log-format", "json", "--metrics-listen", cliWAN+":9100")
+	waitLog(t, dir, "client", `"msg":"ready"`, 20*time.Second)
 
 	st, _, err := client.LoadState(stateFile)
 	if err != nil {
@@ -202,6 +205,8 @@ func TestManagedMigration(t *testing.T) {
 		pinger.count(), pinger.longestGap().Round(10*time.Millisecond))
 	pinger.stop()
 
+	checkTelemetry(t, dir, st.SessionID, session())
+
 	// Gateways remove what they installed when they stop.
 	stopProcess(t, "client")
 	stopProcess(t, "gateway-hk")
@@ -213,6 +218,20 @@ func TestManagedMigration(t *testing.T) {
 	if strings.Contains(out, "MASQUERADE") {
 		t.Errorf("hk left NAT behind:\n%s", out)
 	}
+
+	// 5. Nothing secret reached any log, shutdown messages included.
+	for _, name := range []string{"controller", "gateway-hk", "gateway-sg", "client"} {
+		data, err := os.ReadFile(filepath.Join(dir, name+".log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"gw-secret", "cl-secret", st.Secret} {
+			if strings.Contains(string(data), secret) {
+				t.Errorf("%s's log holds a secret (%.6s...)", name, secret)
+			}
+		}
+	}
+	t.Logf("telemetry: no token or session secret in any log")
 }
 
 // --- harness ---

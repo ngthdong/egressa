@@ -36,6 +36,7 @@ type options struct {
 	clientSubnet, nodeSubnet, policy string
 	probePort                        uint
 	tlsCert, tlsKey                  string
+	metricsListen                    string
 }
 
 func main() {
@@ -55,6 +56,7 @@ func main() {
 	flag.StringVar(&o.policy, "policy", "", "JSON policy document (cost weights, decision thresholds, flap guard) to set on start")
 	flag.StringVar(&o.tlsCert, "tls-cert", "", "serve HTTPS with this certificate")
 	flag.StringVar(&o.tlsKey, "tls-key", "", "and this key")
+	flag.StringVar(&o.metricsListen, "metrics-listen", "", cliutil.MetricsFlagHelp)
 	logs.Register(flag.CommandLine)
 	flag.Parse()
 
@@ -134,10 +136,14 @@ func run(o options, logger *slog.Logger) error {
 		policy = &doc
 	}
 
+	reg, err := cliutil.Metrics(ctx, o.metricsListen, "controller", logger)
+	if err != nil {
+		return err
+	}
 	srv, err := controller.New(ctx, controller.Config{
 		Store: store, GatewayToken: gwToken, ClientToken: clToken, Policy: policy,
 		Network: api.Network{ClientSubnet: cs, NodeSubnet: ns, ProbePort: uint16(o.probePort)},
-		Logger:  logger,
+		Logger:  logger, Metrics: telemetry.NewControllerMetrics(reg),
 	})
 	if err != nil {
 		return err

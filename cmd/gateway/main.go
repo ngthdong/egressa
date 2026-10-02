@@ -38,6 +38,7 @@ func main() {
 		uplink      = flag.String("uplink", "", "interface traffic leaves to the Internet from (needed for the egress role)")
 		keyFile     = flag.String("private-key-file", "/var/lib/egressa/gateway.key", "this gateway's private key (base64), created if missing")
 		mtu         = flag.Int("mtu", gateway.DefaultMTU, "tunnel MTU")
+		metrics     = flag.String("metrics-listen", "", cliutil.MetricsFlagHelp)
 	)
 	logs.Register(flag.CommandLine)
 	flag.Parse()
@@ -77,17 +78,20 @@ func main() {
 	if err != nil {
 		cliutil.Fatal(logger, "load the private key", err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	reg, err := cliutil.Metrics(ctx, *metrics, "gateway", logger)
+	if err != nil {
+		cliutil.Fatal(logger, "start the metrics server", err)
+	}
 	agent, err := gateway.New(gateway.Config{
 		ID: *id, Controller: ctl, Roles: roles, Key: key,
 		ListenPort: uint16(*listenPort), Endpoint: *endpoint, Uplink: *uplink, MTU: *mtu,
-		Logger: logger,
+		Logger: logger, Metrics: telemetry.NewGatewayMetrics(reg),
 	})
 	if err != nil {
 		cliutil.Fatal(logger, "bad configuration", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	logger.Info("starting", "build", buildinfo.String("gateway"), "public_key", tunnel.Base64(key.Public),
 		"controller", *controller, "token", telemetry.Secret(token))
 	if err := agent.Run(ctx); err != nil {

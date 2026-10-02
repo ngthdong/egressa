@@ -55,6 +55,8 @@ type Config struct {
 	AliveAfter time.Duration
 	// Logger receives the controller's logs; nil means slog.Default().
 	Logger *slog.Logger
+	// Metrics, if set, receives the controller's metrics.
+	Metrics *telemetry.ControllerMetrics
 }
 
 type clientRecord struct {
@@ -127,18 +129,48 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// Run marks gateways not alive once they stop reporting, until ctx ends.
+// Run marks gateways not alive once they stop reporting, and refreshes
+// the metrics, every second until ctx ends.
 func (s *Server) Run(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
+	s.publish(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			s.sweep()
+			s.publish(ctx)
 		}
 	}
+}
+
+// publish hands the controller's numbers to the metrics.
+func (s *Server) publish(ctx context.Context) {
+	if s.cfg.Metrics == nil {
+		return
+	}
+	gws, err := s.gateways(ctx)
+	if err != nil {
+		return
+	}
+	raw, err := s.cfg.Store.List(ctx, clientKeyPrefix)
+	if err != nil {
+		return
+	}
+	snap := telemetry.ControllerSnapshot{Sessions: len(raw)}
+	s.mu.Lock()
+	for _, g := range gws {
+		if s.alive[g.ID] {
+			snap.GatewaysAlive++
+		} else {
+			snap.GatewaysDown++
+		}
+	}
+	snap.StateVersion = s.version
+	s.mu.Unlock()
+	s.cfg.Metrics.SetSnapshot(snap)
 }
 
 func (s *Server) sweep() {
@@ -179,7 +211,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions", s.createSession)
 	mux.HandleFunc("GET /v1/sessions/{id}/state", s.sessionAuth(s.clientState))
 	mux.HandleFunc("POST /v1/sessions/{id}/migrate", s.sessionAuth(s.migrate))
-	return mux
+	// The two state routes are long polls: counted, not timed.
+	return s.cfg.Metrics.Middleware(mux, "GET /v1/gateway-state", "GET /v1/sessions/{id}/state")
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -677,6 +710,7 @@ func (s *Server) clientState(w http.ResponseWriter, r *http.Request, c clientRec
 func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord) {
 	var req api.MigrateRequest
 	if !decode(w, r, &req) {
+		s.cfg.Metrics.Migration(telemetry.MigrationRejected)
 		return
 	}
 	ctx := r.Context()
@@ -684,23 +718,28 @@ func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord)
 	defer s.mu.Unlock()
 	gws, err := s.gateways(ctx)
 	if err != nil {
+		s.cfg.Metrics.Migration(telemetry.MigrationError)
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if g, ok := api.FindGateway(gws, req.Access); !ok || !g.Roles.Has(control.RoleAccess) {
+		s.cfg.Metrics.Migration(telemetry.MigrationRejected)
 		writeErr(w, http.StatusBadRequest, "no access gateway %q", req.Access)
 		return
 	}
 	if g, ok := api.FindGateway(gws, req.Egress); !ok || !g.Roles.Has(control.RoleEgress) {
+		s.cfg.Metrics.Migration(telemetry.MigrationRejected)
 		writeErr(w, http.StatusBadRequest, "no egress gateway %q", req.Egress)
 		return
 	}
 	cur, err := s.session(ctx, c)
 	if err != nil {
+		s.cfg.Metrics.Migration(telemetry.MigrationError)
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	conflict := func(sess api.Session) {
+		s.cfg.Metrics.Migration(telemetry.MigrationConflict)
 		writeJSON(w, http.StatusConflict, api.Error{Error: "the session is at another epoch", Session: &sess})
 	}
 	if req.Epoch != cur.Epoch {
@@ -710,6 +749,7 @@ func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord)
 	next := control.OwnershipRecord{Session: c.ID, Access: req.Access, Egress: req.Egress, Epoch: cur.Epoch + 1}
 	applied, err := s.ownership.SetIfNewer(ctx, next)
 	if err != nil {
+		s.cfg.Metrics.Migration(telemetry.MigrationError)
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -719,10 +759,12 @@ func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord)
 			conflict(now)
 			return
 		}
+		s.cfg.Metrics.Migration(telemetry.MigrationConflict)
 		writeErr(w, http.StatusConflict, "the session moved concurrently")
 		return
 	}
 	s.bumpLocked()
+	s.cfg.Metrics.Migration(telemetry.MigrationCommitted)
 	s.log.InfoContext(telemetry.WithMigration(ctx, c.ID, next.Epoch), "session migrated",
 		"access", next.Access, "egress", next.Egress, "from_access", cur.Access, "from_egress", cur.Egress)
 	cur.Access, cur.Egress, cur.Epoch = next.Access, next.Egress, next.Epoch

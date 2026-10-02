@@ -2,6 +2,7 @@
 package cliutil
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -57,3 +58,20 @@ func Fatal(l *slog.Logger, msg string, err error) {
 	l.Error(msg, telemetry.Err(err))
 	os.Exit(1)
 }
+
+// Metrics starts serving the metrics of a process of role on addr and
+// returns its registry; with no addr it returns nil, and every metrics
+// value made from a nil registry records nothing.
+func Metrics(ctx context.Context, addr, role string, l *slog.Logger) (*telemetry.Registry, error) {
+	if addr == "" {
+		return nil, nil
+	}
+	reg := telemetry.NewRegistry(role, buildinfo.Version, buildinfo.Commit)
+	if _, err := telemetry.ServeMetrics(ctx, addr, reg, l); err != nil {
+		return nil, fmt.Errorf("--metrics-listen %s: %w", addr, err)
+	}
+	return reg, nil
+}
+
+// MetricsFlagHelp is the help text of every binary's --metrics-listen.
+const MetricsFlagHelp = "serve Prometheus metrics on /metrics at this address, e.g. 127.0.0.1:9100 (default: off); it has no authentication, so keep it private"

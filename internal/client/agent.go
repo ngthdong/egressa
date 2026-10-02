@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ngthdong/egressa/internal/api"
@@ -55,6 +56,17 @@ type Config struct {
 	Probe      pathmon.Config
 	// Logger receives the agent's logs; nil means slog.Default().
 	Logger *slog.Logger
+	// Metrics, if set, receives the agent's metrics.
+	Metrics *telemetry.ClientMetrics
+}
+
+// pendingMigration is a move the client has decided on and asked the
+// controller to commit. Whichever path brings the new epoch in first (the
+// controller's answer, or the state long poll) credits it to the cause.
+type pendingMigration struct {
+	toEpoch uint64
+	cause   string
+	start   time.Time
 }
 
 // Agent runs one client.
@@ -68,6 +80,9 @@ type Agent struct {
 	dev       *tunnel.RealDevice
 	mon       *pathmon.Monitor
 	start     time.Time
+	// controllerUp is whether the last request to the controller got an
+	// answer.
+	controllerUp atomic.Bool
 
 	mu       sync.Mutex
 	session  api.Session
@@ -80,6 +95,7 @@ type Agent struct {
 	since    time.Time // when the current path became current
 	original tunnel.RouteInfo
 	hadRoute bool
+	pending  *pendingMigration
 }
 
 // New checks cfg and returns an Agent ready to Run.
@@ -157,6 +173,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("client: read state: %w", err)
 	}
+	a.controllerUp.Store(true)
 	sessionID, err := strconv.ParseUint(a.session.ID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("client: session ID %q: %w", a.session.ID, err)
@@ -279,7 +296,8 @@ func (a *Agent) addBypass(host netip.Addr) {
 
 func (a *Agent) pollLoop(ctx context.Context, version uint64) {
 	for {
-		st, err := a.cfg.Controller.ClientState(ctx, a.session.ID, a.secret, version, statePollWait)
+		st, err := a.cfg.Controller.ClientState(ctx, a.sessionID, a.secret, version, statePollWait)
+		a.noteController(err)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -374,6 +392,17 @@ func (a *Agent) adopt(sess api.Session) {
 	now := time.Now()
 	a.since = now
 	a.decider.Reset(now)
+	// Credit the move to the client's own decision if it is the one the
+	// client asked for, else to whoever else moved the session.
+	cause, began := telemetry.CauseExternal, time.Time{}
+	if p := a.pending; p != nil && p.toEpoch == sess.Epoch {
+		cause, began = p.cause, p.start
+	}
+	a.pending = nil
+	a.cfg.Metrics.Migration(cause, telemetry.ResultCommitted)
+	if !began.IsZero() {
+		a.cfg.Metrics.MigrationDuration(cause, now.Sub(began))
+	}
 	a.log.InfoContext(telemetry.WithMigration(context.Background(), sess.ID, sess.Epoch), "path changed",
 		"access", sess.Access, "egress", sess.Egress, "from_access", old.Access, "from_egress", old.Egress)
 }
@@ -431,22 +460,89 @@ func (a *Agent) decideOnce(ctx context.Context) {
 	a.mu.Lock()
 	sess := a.session
 	dec := a.decider.Decide(now, sess.Access, sess.Egress, paths, dead)
+	if dec.Migrate {
+		a.pending = &pendingMigration{toEpoch: sess.Epoch + 1, cause: dec.Cause, start: now}
+	}
+	accessIDs := make([]string, 0, len(a.gateways))
+	for _, g := range a.gateways {
+		if g.Roles.Has(control.RoleAccess) {
+			accessIDs = append(accessIDs, g.ID)
+		}
+	}
 	a.mu.Unlock()
+	a.cfg.Metrics.Decision(dec.Outcome)
+	a.publish(sess, accessIDs, paths, dead, dec)
 	if !dec.Migrate {
 		return
 	}
 	a.log.InfoContext(a.logCtx(), "migrating", "access", dec.Access, "egress", dec.Egress, "reason", dec.Reason)
 	next, err := a.cfg.Controller.Migrate(ctx, sess.ID, a.secret, api.MigrateRequest{Epoch: sess.Epoch, Access: dec.Access, Egress: dec.Egress})
+	a.noteController(err)
 	var conflict *api.ConflictError
 	switch {
 	case errors.As(err, &conflict):
 		a.log.InfoContext(a.logCtx(), "migration lost to a newer epoch", "now_epoch", conflict.Current.Epoch)
+		a.cfg.Metrics.Migration(dec.Cause, telemetry.ResultConflict)
+		a.clearPending()
 		a.adopt(conflict.Current)
 	case err != nil:
 		a.log.WarnContext(a.logCtx(), "migration failed; staying", telemetry.Err(err))
+		a.cfg.Metrics.Migration(dec.Cause, telemetry.ResultFailed)
+		a.clearPending()
 	default:
 		a.adopt(next)
 	}
+}
+
+func (a *Agent) clearPending() {
+	a.mu.Lock()
+	a.pending = nil
+	a.mu.Unlock()
+}
+
+// noteController records whether a request reached the controller: any
+// answer from it, an error status included, means it is up.
+func (a *Agent) noteController(err error) {
+	var se *api.StatusError
+	var ce *api.ConflictError
+	a.controllerUp.Store(err == nil || errors.As(err, &se) || errors.As(err, &ce))
+}
+
+// publish hands the decision pass's numbers to the metrics.
+func (a *Agent) publish(sess api.Session, accessIDs []string, paths []Path, dead bool, dec Decision) {
+	if a.cfg.Metrics == nil {
+		return
+	}
+	snap := telemetry.ClientSnapshot{
+		ThresholdMicros: dec.Threshold,
+		ActiveAccess:    sess.Access, ActiveEgress: sess.Egress,
+		Epoch: sess.Epoch, CurrentDead: dead, ControllerUp: a.controllerUp.Load(),
+	}
+	for _, id := range accessIDs {
+		st, _, ok := a.mon.Stats(id)
+		if !ok {
+			continue
+		}
+		snap.Segments = append(snap.Segments, telemetry.SegmentSample{
+			Gateway: id, P50Micros: st.P50Micros, P95Micros: st.P95Micros,
+			LossRatio: st.LossRate, Confidence: st.Confidence, Samples: st.N,
+		})
+	}
+	for i, p := range paths {
+		ps := telemetry.PathSample{Access: p.Access, Egress: p.Egress, Reachable: p.Reachable}
+		measured := true
+		for _, seg := range p.Segments {
+			measured = measured && seg.N > 0
+		}
+		if i < len(dec.Evals) {
+			ev := dec.Evals[i]
+			ps.CostMicros = ev.Cost
+			ps.Usable = measured && !math.IsInf(ev.Cost, 0)
+			ps.DeltaLowerMicros, ps.HasDelta = ev.Delta.Lower, ev.HasDelta
+		}
+		snap.Paths = append(snap.Paths, ps)
+	}
+	a.cfg.Metrics.SetSnapshot(snap)
 }
 
 func (a *Agent) logStatus() {

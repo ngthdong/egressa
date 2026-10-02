@@ -141,3 +141,21 @@ func TestNew_Validates(t *testing.T) {
 		t.Errorf("an access-only gateway needs no uplink: %v", err)
 	}
 }
+
+func TestMakePlan_CountsSessionsByRole(t *testing.T) {
+	for _, tc := range []struct {
+		me             string
+		roles          api.Roles
+		access, egress int
+	}{
+		{"hk", both, 2, 2},               // sessions 1 and 3 enter at hk; 1 and 2 leave there
+		{"sg", both, 1, 0},               // session 2 enters at sg
+		{"sg", control.RoleAccess, 1, 0}, // an access-only gateway carries no egress
+		{"eu", control.RoleEgress, 0, 1}, // session 3 leaves at eu
+	} {
+		p := MakePlan(tc.me, tc.roles, testState())
+		if p.AccessSessions != tc.access || p.EgressSessions != tc.egress {
+			t.Errorf("%s (%s): access %d, egress %d; want %d, %d", tc.me, tc.roles, p.AccessSessions, p.EgressSessions, tc.access, tc.egress)
+		}
+	}
+}

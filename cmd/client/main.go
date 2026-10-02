@@ -42,6 +42,7 @@ func main() {
 
 		ifaceName  = flag.String("interface", "egressa0", "TUN interface name")
 		fullTunnel = flag.Bool("full-tunnel", false, "route ALL host traffic through the VPN (replaces the default route; gateways and the controller stay reachable directly)")
+		metrics    = flag.String("metrics-listen", "", "managed mode: "+cliutil.MetricsFlagHelp)
 	)
 	logs.Register(flag.CommandLine)
 	flag.Parse()
@@ -83,6 +84,12 @@ func main() {
 	if err != nil {
 		cliutil.Fatal(logger, "bad --controller", err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	reg, err := cliutil.Metrics(ctx, *metrics, "client", logger)
+	if err != nil {
+		cliutil.Fatal(logger, "start the metrics server", err)
+	}
 	agent, err := client.New(client.Config{
 		Controller: ctl,
 		StateFile:  *stateFile,
@@ -90,12 +97,11 @@ func main() {
 		Egress:     *egress,
 		FullTunnel: *fullTunnel,
 		Logger:     logger,
+		Metrics:    telemetry.NewClientMetrics(reg),
 	})
 	if err != nil {
 		cliutil.Fatal(logger, "bad configuration", err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	logger.Info("starting", "build", buildinfo.String("client"), "controller", *controller, "token", telemetry.Secret(token))
 	if err := agent.Run(ctx); err != nil {
 		cliutil.Fatal(logger, "client failed", err)

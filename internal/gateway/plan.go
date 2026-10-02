@@ -64,6 +64,10 @@ type Plan struct {
 	Return map[netip.Addr]string
 	// Epochs maps a session ID to its current epoch.
 	Epochs map[string]uint64
+	// AccessSessions and EgressSessions count the sessions whose current
+	// access, or egress, this gateway is.
+	AccessSessions int
+	EgressSessions int
 }
 
 // MakePlan computes gateway me's configuration for st.
@@ -93,6 +97,12 @@ func MakePlan(me string, roles api.Roles, st api.GatewayState) Plan {
 	isEgress := roles.Has(control.RoleEgress)
 	for _, s := range st.Sessions {
 		p.Epochs[s.ID] = s.Epoch
+		if isAccess && s.Access == me {
+			p.AccessSessions++
+		}
+		if isEgress && s.Egress == me {
+			p.EgressSessions++
+		}
 		if isAccess {
 			p.Peers[s.PublicKey] = s.VirtualIP
 			if s.Egress != me && known[s.Egress] {

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ngthdong/egressa/internal/api"
@@ -51,6 +52,8 @@ type Config struct {
 	Probe pathmon.Config
 	// Logger receives the agent's logs; nil means slog.Default().
 	Logger *slog.Logger
+	// Metrics, if set, receives the agent's metrics.
+	Metrics *telemetry.GatewayMetrics
 }
 
 type backbone struct {
@@ -68,9 +71,14 @@ type Agent struct {
 	nodeIP  netip.Addr
 	network api.Network
 	gate    *control.EpochGate
-	egc     *tunnel.RealDevice
-	mon     *pathmon.Monitor
-	undo    []func()
+	// fence is what admit reads on every packet: session ID -> the
+	// lowest epoch admitted, copied from gate after each change. A plain
+	// map of integers behind an atomic pointer, so the packet path never
+	// formats a session ID or takes a lock.
+	fence atomic.Pointer[map[uint64]uint64]
+	egc   *tunnel.RealDevice
+	mon   *pathmon.Monitor
+	undo  []func()
 
 	mu        sync.Mutex
 	index     map[string]int // gateway ID -> n, for egb<n> and its table
@@ -80,6 +88,14 @@ type Agent struct {
 	forward   map[netip.Addr]string
 	ret       map[netip.Addr]string
 	ports     map[string]uint16 // backbone ports as last registered
+	// fenced holds every session ID ever applied, parsed, so the fence
+	// map covers every session gate knows.
+	fenced map[string]uint64
+	// carried counts the sessions of the plan last applied, for metrics.
+	accessSessions, egressSessions int
+
+	stateVersion atomic.Uint64
+	controllerUp atomic.Bool
 }
 
 // New checks cfg and returns an Agent ready to Run.
@@ -102,7 +118,7 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Agent{
+	a := &Agent{
 		cfg:       cfg,
 		log:       cfg.Logger,
 		gate:      control.NewEpochGate(),
@@ -111,7 +127,10 @@ func New(cfg Config) (*Agent, error) {
 		peers:     make(map[string]netip.Addr),
 		forward:   make(map[netip.Addr]string),
 		ret:       make(map[netip.Addr]string),
-	}, nil
+		fenced:    make(map[string]uint64),
+	}
+	a.fence.Store(&map[uint64]uint64{})
+	return a, nil
 }
 
 // Run registers, configures the host, and follows the controller until
@@ -140,6 +159,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	var version uint64
 	for {
 		st, err := a.cfg.Controller.GatewayState(runCtx, version, pollWait)
+		a.noteController(err)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -155,7 +175,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		version = st.Version
 		if err := a.apply(MakePlan(a.cfg.ID, a.cfg.Roles, st)); err != nil {
 			a.log.Warn("apply failed", telemetry.Err(err))
+			a.cfg.Metrics.ApplyError()
 		}
+		a.stateVersion.Store(st.Version)
+		a.publish()
 		if a.portsChanged() {
 			if _, err := a.register(runCtx); err != nil {
 				a.log.Warn("re-register failed", telemetry.Err(err))
@@ -227,12 +250,74 @@ func (a *Agent) portsChanged() bool {
 
 // admit fences a client packet stamped with an epoch older than its
 // session's current one: it is from before a migration this gateway has
-// already seen committed.
+// already seen committed. It runs for every packet, so it neither
+// allocates nor locks: it reads the fence map, a copy of gate's epochs
+// (an unknown session is admitted, as gate.Admit admits it).
 func (a *Agent) admit(h wire.SessionHeader) bool {
 	if h.SessionID == 0 {
 		return true
 	}
-	return a.gate.Admit(strconv.FormatUint(h.SessionID, 10), uint64(h.Epoch))
+	if known, ok := (*a.fence.Load())[h.SessionID]; ok && uint64(h.Epoch) < known {
+		a.cfg.Metrics.Fenced()
+		return false
+	}
+	return true
+}
+
+// updateFenceLocked copies gate's epoch of every session seen so far into
+// a new fence map.
+func (a *Agent) updateFenceLocked(epochs map[string]uint64) {
+	for session := range epochs {
+		if _, ok := a.fenced[session]; ok {
+			continue
+		}
+		if id, err := strconv.ParseUint(session, 10, 64); err == nil {
+			a.fenced[session] = id
+		}
+	}
+	next := make(map[uint64]uint64, len(a.fenced))
+	for session, id := range a.fenced {
+		if epoch, ok := a.gate.Known(session); ok {
+			next[id] = epoch
+		}
+	}
+	a.fence.Store(&next)
+}
+
+// noteController records whether a request reached the controller: any
+// answer from it, an error status included, means it is up.
+func (a *Agent) noteController(err error) {
+	var se *api.StatusError
+	a.controllerUp.Store(err == nil || errors.As(err, &se))
+}
+
+// publish hands the gateway's numbers to the metrics.
+func (a *Agent) publish() {
+	if a.cfg.Metrics == nil {
+		return
+	}
+	a.mu.Lock()
+	snap := telemetry.GatewaySnapshot{
+		AccessSessions: a.accessSessions, EgressSessions: a.egressSessions,
+		StateVersion: a.stateVersion.Load(), ControllerUp: a.controllerUp.Load(),
+	}
+	type peer struct {
+		id string
+		up bool
+	}
+	peers := make([]peer, 0, len(a.backbones))
+	for id, b := range a.backbones {
+		peers = append(peers, peer{id, b.up})
+	}
+	a.mu.Unlock()
+	for _, p := range peers {
+		bs := telemetry.BackboneSample{Peer: p.id, Up: p.up}
+		if st, _, ok := a.mon.Stats(p.id); ok {
+			bs.P50Micros, bs.P95Micros, bs.LossRatio, bs.Samples = st.P50Micros, st.P95Micros, st.LossRate, st.N
+		}
+		snap.Backbones = append(snap.Backbones, bs)
+	}
+	a.cfg.Metrics.SetSnapshot(snap)
 }
 
 func (a *Agent) setup() error {
@@ -394,6 +479,8 @@ func (a *Agent) apply(p Plan) error {
 	for session, epoch := range p.Epochs {
 		a.gate.Update(session, epoch)
 	}
+	a.updateFenceLocked(p.Epochs)
+	a.accessSessions, a.egressSessions = p.AccessSessions, p.EgressSessions
 
 	for vip, egress := range a.forward {
 		if p.Forward[vip] == egress {
@@ -557,6 +644,12 @@ func (a *Agent) reportLoop(ctx context.Context) {
 			}
 		}
 		err := a.cfg.Controller.ReportLinks(ctx, a.cfg.ID, rep)
+		a.noteController(err)
+		if err == nil {
+			a.cfg.Metrics.LinkReport(telemetry.ReportOK)
+		} else {
+			a.cfg.Metrics.LinkReport(telemetry.ReportError)
+		}
 		var se *api.StatusError
 		if errors.As(err, &se) && se.Code == http.StatusNotFound {
 			// The controller lost its state; register again.
@@ -565,5 +658,6 @@ func (a *Agent) reportLoop(ctx context.Context) {
 		if err != nil && ctx.Err() == nil {
 			a.log.Warn("link report failed", telemetry.Err(err))
 		}
+		a.publish()
 	}
 }

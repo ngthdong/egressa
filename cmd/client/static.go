@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/ngthdong/egressa/internal/telemetry"
 	"github.com/ngthdong/egressa/internal/tunnel"
 )
 
@@ -28,7 +29,7 @@ type connectConfig struct {
 // runConnect brings this host up as a VPN client of one gateway: a real
 // OS-level TUN interface, peered with it, optionally routing all host
 // traffic through it. Needs CAP_NET_ADMIN.
-func runConnect(cfg connectConfig) error {
+func runConnect(cfg connectConfig, logger *slog.Logger) error {
 	if cfg.gatewayPubKeyB64 == "" || cfg.gatewayEndpoint == "" {
 		return fmt.Errorf("--connect requires --gateway-pubkey and --gateway-endpoint")
 	}
@@ -54,7 +55,7 @@ func runConnect(cfg connectConfig) error {
 	}
 	var zeroPub [tunnel.KeySize]byte
 	if priv.Public != zeroPub {
-		log.Printf("client: public key: %s", tunnel.Base64(priv.Public))
+		logger.Info("public key", "public_key", tunnel.Base64(priv.Public))
 	}
 
 	dev, err := tunnel.NewReal(tunnel.RealConfig{
@@ -78,26 +79,26 @@ func runConnect(cfg connectConfig) error {
 		return fmt.Errorf("add gateway peer: %w", err)
 	}
 
-	log.Printf("client: connected, interface %s, virtual IP %s", dev.Name(), clientAddr)
+	logger.Info("connected", "interface", dev.Name(), "virtual_ip", clientAddr.String())
 
 	if cfg.fullTunnel {
-		log.Printf("client: --full-tunnel set: replacing the default route (see the warning on EnableFullTunnel)")
+		logger.Info("full tunnel on: replacing the default route")
 		restore, err := tunnel.EnableFullTunnel(dev.Name(), gatewayHost.Addr())
 		if err != nil {
 			return fmt.Errorf("enable full tunnel: %w", err)
 		}
 		defer func() {
-			log.Printf("client: restoring original default route")
+			logger.Info("restoring the original default route")
 			if err := restore(); err != nil {
-				log.Printf("client: WARNING: failed to fully restore routing: %v", err)
+				logger.Warn("restoring routes failed", telemetry.Err(err))
 			}
 		}()
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("client: ready")
+	logger.Info("ready")
 	<-ctx.Done()
-	log.Printf("client: shutting down")
+	logger.Info("shutting down")
 	return nil
 }

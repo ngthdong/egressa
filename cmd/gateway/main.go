@@ -12,7 +12,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,11 +21,13 @@ import (
 	"github.com/ngthdong/egressa/internal/buildinfo"
 	"github.com/ngthdong/egressa/internal/cliutil"
 	"github.com/ngthdong/egressa/internal/gateway"
+	"github.com/ngthdong/egressa/internal/telemetry"
 	"github.com/ngthdong/egressa/internal/tunnel"
 )
 
 func main() {
 	var (
+		logs        cliutil.LogFlags
 		showVersion = flag.Bool("version", false, "print version and exit")
 		id          = flag.String("id", "", "this gateway's ID, e.g. hk or sg (lowercase letters, digits, dashes)")
 		controller  = flag.String("controller", "", "controller URL, http(s)://host:port")
@@ -38,6 +39,7 @@ func main() {
 		keyFile     = flag.String("private-key-file", "/var/lib/egressa/gateway.key", "this gateway's private key (base64), created if missing")
 		mtu         = flag.Int("mtu", gateway.DefaultMTU, "tunnel MTU")
 	)
+	logs.Register(flag.CommandLine)
 	flag.Parse()
 
 	if *showVersion {
@@ -48,40 +50,47 @@ func main() {
 		fmt.Fprintln(os.Stderr, "gateway: --id, --controller and --endpoint are required; see -h")
 		os.Exit(2)
 	}
+	logger, err := logs.Logger("gateway", *id)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gateway:", err)
+		os.Exit(2)
+	}
 	if *listenPort == 0 || *listenPort > 65535 {
-		log.Fatalf("gateway: bad --listen-port %d", *listenPort)
+		cliutil.Fatal(logger, "bad --listen-port", fmt.Errorf("%d is not a port", *listenPort))
 	}
 	roles, err := api.ParseRoles(*role)
 	if err != nil {
-		log.Fatalf("gateway: %v", err)
+		cliutil.Fatal(logger, "bad --role", err)
 	}
 	token, err := cliutil.Secret(*tokenFile, "EGRESSA_GATEWAY_TOKEN")
 	if err != nil {
-		log.Fatalf("gateway: %v", err)
+		cliutil.Fatal(logger, "read the gateway token", err)
 	}
 	ctl, err := api.NewClient(*controller, token)
 	if err != nil {
-		log.Fatalf("gateway: %v", err)
+		cliutil.Fatal(logger, "bad --controller", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(*keyFile), 0o700); err != nil {
-		log.Fatalf("gateway: %v", err)
+		cliutil.Fatal(logger, "create the key directory", err)
 	}
 	key, err := tunnel.LoadOrCreatePrivateKey(*keyFile)
 	if err != nil {
-		log.Fatalf("gateway: %v", err)
+		cliutil.Fatal(logger, "load the private key", err)
 	}
 	agent, err := gateway.New(gateway.Config{
 		ID: *id, Controller: ctl, Roles: roles, Key: key,
 		ListenPort: uint16(*listenPort), Endpoint: *endpoint, Uplink: *uplink, MTU: *mtu,
+		Logger: logger,
 	})
 	if err != nil {
-		log.Fatalf("gateway: %v", err)
+		cliutil.Fatal(logger, "bad configuration", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("gateway: starting (%s), public key %s", buildinfo.String("gateway"), tunnel.Base64(key.Public))
+	logger.Info("starting", "build", buildinfo.String("gateway"), "public_key", tunnel.Base64(key.Public),
+		"controller", *controller, "token", telemetry.Secret(token))
 	if err := agent.Run(ctx); err != nil {
-		log.Fatalf("gateway: fatal: %v", err)
+		cliutil.Fatal(logger, "gateway failed", err)
 	}
 }

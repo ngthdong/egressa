@@ -15,7 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"regexp"
@@ -27,6 +27,7 @@ import (
 
 	"github.com/ngthdong/egressa/internal/api"
 	"github.com/ngthdong/egressa/internal/control"
+	"github.com/ngthdong/egressa/internal/telemetry"
 )
 
 const (
@@ -52,7 +53,8 @@ type Config struct {
 	// Policy, if set, is stored as the current policy on start.
 	Policy     *control.PolicyDocument
 	AliveAfter time.Duration
-	Logf       func(format string, args ...any)
+	// Logger receives the controller's logs; nil means slog.Default().
+	Logger *slog.Logger
 }
 
 type clientRecord struct {
@@ -70,6 +72,7 @@ type linkEntry struct {
 // Server serves the controller's HTTP API.
 type Server struct {
 	cfg       Config
+	log       *slog.Logger
 	ownership *control.OwnershipService
 	policy    *control.PolicyService
 	now       func() time.Time
@@ -101,11 +104,12 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.AliveAfter <= 0 {
 		cfg.AliveAfter = DefaultAliveAfter
 	}
-	if cfg.Logf == nil {
-		cfg.Logf = log.Printf
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
 	s := &Server{
 		cfg:       cfg,
+		log:       cfg.Logger,
 		ownership: control.NewOwnershipService(cfg.Store),
 		policy:    control.NewPolicyService(cfg.Store),
 		now:       time.Now,
@@ -144,7 +148,7 @@ func (s *Server) sweep() {
 	for id, alive := range s.alive {
 		if alive && now.Sub(s.lastSeen[id]) > s.cfg.AliveAfter {
 			s.alive[id] = false
-			s.cfg.Logf("controller: gateway %s stopped reporting", id)
+			s.log.Warn("gateway stopped reporting", "gateway", id)
 			s.bumpLocked()
 		}
 	}
@@ -389,7 +393,7 @@ func (s *Server) registerGateway(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !existed {
-			s.cfg.Logf("controller: gateway %s (%s) joined at %s, node IP %s", id, req.Roles, req.Endpoint, g.NodeIP)
+			s.log.Info("gateway joined", "gateway", id, "roles", req.Roles.String(), "endpoint", req.Endpoint, "node_ip", g.NodeIP.String())
 		}
 		s.bumpLocked()
 	}
@@ -488,7 +492,7 @@ func (s *Server) gatewayState(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cs {
 		sess, err := s.session(ctx, c)
 		if err != nil {
-			s.cfg.Logf("controller: %v", err)
+			s.log.Warn("session left out of the gateway state", telemetry.Err(err))
 			continue
 		}
 		st.Sessions = append(st.Sessions, sess)
@@ -629,7 +633,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.bumpLocked()
-	s.cfg.Logf("controller: session %s opened: virtual IP %s, access %s, egress %s", id, vip, access, egress)
+	s.log.InfoContext(telemetry.WithSession(ctx, id), "session opened", "virtual_ip", vip.String(), "access", access, "egress", egress)
 	sess := api.Session{ID: id, PublicKey: req.PublicKey, VirtualIP: vip, Access: access, Egress: egress, Epoch: 1}
 	writeJSON(w, http.StatusOK, api.CreateSessionResponse{Session: sess, Secret: secret, Network: s.cfg.Network})
 }
@@ -719,8 +723,8 @@ func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord)
 		return
 	}
 	s.bumpLocked()
-	s.cfg.Logf("controller: session %s epoch %d -> %d: access %s -> %s, egress %s -> %s",
-		c.ID, cur.Epoch, next.Epoch, cur.Access, next.Access, cur.Egress, next.Egress)
+	s.log.InfoContext(telemetry.WithMigration(ctx, c.ID, next.Epoch), "session migrated",
+		"access", next.Access, "egress", next.Egress, "from_access", cur.Access, "from_egress", cur.Egress)
 	cur.Access, cur.Egress, cur.Epoch = next.Access, next.Egress, next.Epoch
 	writeJSON(w, http.StatusOK, cur)
 }

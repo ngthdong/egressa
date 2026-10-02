@@ -89,8 +89,8 @@ func TestManagedMigration(t *testing.T) {
 			"--endpoint", gw.wan+":51820", "--uplink", "inet0",
 			"--private-key-file", filepath.Join(dir, gw.id+".key"))
 	}
-	waitLog(t, dir, "gateway-hk", "ready", 20*time.Second)
-	waitLog(t, dir, "gateway-sg", "ready", 20*time.Second)
+	waitLog(t, dir, "gateway-hk", "msg=ready", 20*time.Second)
+	waitLog(t, dir, "gateway-sg", "msg=ready", 20*time.Second)
 
 	stopEcho := runEchoServer(t)
 	defer stopEcho()
@@ -98,7 +98,7 @@ func TestManagedMigration(t *testing.T) {
 	stateFile := filepath.Join(dir, "client.json")
 	start(t, dir, "client", "cli", tokens, bin+"/client",
 		"--controller", ctlURL, "--state-file", stateFile, "--egress", "hk", "--full-tunnel")
-	waitLog(t, dir, "client", "client: ready", 20*time.Second)
+	waitLog(t, dir, "client", "msg=ready", 20*time.Second)
 
 	st, _, err := client.LoadState(stateFile)
 	if err != nil {

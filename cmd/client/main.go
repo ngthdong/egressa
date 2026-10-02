@@ -13,7 +13,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -22,10 +21,12 @@ import (
 	"github.com/ngthdong/egressa/internal/buildinfo"
 	"github.com/ngthdong/egressa/internal/client"
 	"github.com/ngthdong/egressa/internal/cliutil"
+	"github.com/ngthdong/egressa/internal/telemetry"
 )
 
 func main() {
 	var (
+		logs        cliutil.LogFlags
 		showVersion = flag.Bool("version", false, "print version and exit")
 
 		controller = flag.String("controller", "", "controller URL, http(s)://host:port (managed mode)")
@@ -42,11 +43,17 @@ func main() {
 		ifaceName  = flag.String("interface", "egressa0", "TUN interface name")
 		fullTunnel = flag.Bool("full-tunnel", false, "route ALL host traffic through the VPN (replaces the default route; gateways and the controller stay reachable directly)")
 	)
+	logs.Register(flag.CommandLine)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(buildinfo.String("client"))
 		return
+	}
+	logger, err := logs.Logger("client", "")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "client:", err)
+		os.Exit(2)
 	}
 
 	if *connect {
@@ -58,8 +65,8 @@ func main() {
 			privateKeyFile:   *privateKeyFile,
 			fullTunnel:       *fullTunnel,
 		}
-		if err := runConnect(cfg); err != nil {
-			log.Fatalf("client: fatal: %v", err)
+		if err := runConnect(cfg, logger); err != nil {
+			cliutil.Fatal(logger, "client failed", err)
 		}
 		return
 	}
@@ -70,11 +77,11 @@ func main() {
 	}
 	token, err := cliutil.Secret(*tokenFile, "EGRESSA_CLIENT_TOKEN")
 	if err != nil {
-		log.Fatalf("client: %v", err)
+		cliutil.Fatal(logger, "read the client token", err)
 	}
 	ctl, err := api.NewClient(*controller, token)
 	if err != nil {
-		log.Fatalf("client: %v", err)
+		cliutil.Fatal(logger, "bad --controller", err)
 	}
 	agent, err := client.New(client.Config{
 		Controller: ctl,
@@ -82,15 +89,16 @@ func main() {
 		Interface:  *ifaceName,
 		Egress:     *egress,
 		FullTunnel: *fullTunnel,
+		Logger:     logger,
 	})
 	if err != nil {
-		log.Fatalf("client: %v", err)
+		cliutil.Fatal(logger, "bad configuration", err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("client: starting (%s)", buildinfo.String("client"))
+	logger.Info("starting", "build", buildinfo.String("client"), "controller", *controller, "token", telemetry.Secret(token))
 	if err := agent.Run(ctx); err != nil {
-		log.Fatalf("client: fatal: %v", err)
+		cliutil.Fatal(logger, "client failed", err)
 	}
-	log.Printf("client: shut down")
+	logger.Info("shut down")
 }

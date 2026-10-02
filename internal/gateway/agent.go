@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/netip"
@@ -16,6 +16,7 @@ import (
 	"github.com/ngthdong/egressa/internal/api"
 	"github.com/ngthdong/egressa/internal/control"
 	"github.com/ngthdong/egressa/internal/pathmon"
+	"github.com/ngthdong/egressa/internal/telemetry"
 	"github.com/ngthdong/egressa/internal/tunnel"
 	"github.com/ngthdong/egressa/pkg/wire"
 )
@@ -48,7 +49,8 @@ type Config struct {
 	// Probe configures backbone probing; the zero value means
 	// pathmon.DefaultConfig().
 	Probe pathmon.Config
-	Logf  func(format string, args ...any)
+	// Logger receives the agent's logs; nil means slog.Default().
+	Logger *slog.Logger
 }
 
 type backbone struct {
@@ -62,6 +64,7 @@ type backbone struct {
 // Agent runs one gateway.
 type Agent struct {
 	cfg     Config
+	log     *slog.Logger
 	nodeIP  netip.Addr
 	network api.Network
 	gate    *control.EpochGate
@@ -96,11 +99,12 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Probe.Budget == nil {
 		cfg.Probe = pathmon.DefaultConfig()
 	}
-	if cfg.Logf == nil {
-		cfg.Logf = log.Printf
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
 	return &Agent{
 		cfg:       cfg,
+		log:       cfg.Logger,
 		gate:      control.NewEpochGate(),
 		index:     make(map[string]int),
 		backbones: make(map[string]*backbone),
@@ -108,10 +112,6 @@ func New(cfg Config) (*Agent, error) {
 		forward:   make(map[netip.Addr]string),
 		ret:       make(map[netip.Addr]string),
 	}, nil
-}
-
-func (a *Agent) logf(format string, args ...any) {
-	a.cfg.Logf("gateway %s: "+format, append([]any{a.cfg.ID}, args...)...)
 }
 
 // Run registers, configures the host, and follows the controller until
@@ -122,7 +122,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		return err
 	}
 	a.nodeIP, a.network = reg.NodeIP, reg.Network
-	a.logf("registered, node IP %s, client subnet %s", a.nodeIP, a.network.ClientSubnet)
+	a.log.Info("registered", "node_ip", a.nodeIP.String(), "client_subnet", a.network.ClientSubnet.String())
 	defer a.teardown()
 	if err := a.setup(); err != nil {
 		return err
@@ -136,7 +136,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); _ = a.mon.Run(runCtx) }()
 	go func() { defer wg.Done(); a.reportLoop(runCtx) }()
 
-	a.logf("ready")
+	a.log.Info("ready")
 	var version uint64
 	for {
 		st, err := a.cfg.Controller.GatewayState(runCtx, version, pollWait)
@@ -144,7 +144,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			a.logf("controller: %v", err)
+			a.log.Warn("controller unreachable", telemetry.Err(err))
 			select {
 			case <-ctx.Done():
 				return nil
@@ -154,11 +154,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		version = st.Version
 		if err := a.apply(MakePlan(a.cfg.ID, a.cfg.Roles, st)); err != nil {
-			a.logf("apply: %v", err)
+			a.log.Warn("apply failed", telemetry.Err(err))
 		}
 		if a.portsChanged() {
 			if _, err := a.register(runCtx); err != nil {
-				a.logf("re-register: %v", err)
+				a.log.Warn("re-register failed", telemetry.Err(err))
 			}
 		}
 	}
@@ -186,7 +186,7 @@ func (a *Agent) register(ctx context.Context) (api.RegisterGatewayResponse, erro
 	a.ports = ports
 	a.mu.Unlock()
 	if a.nodeIP.IsValid() && resp.NodeIP != a.nodeIP {
-		a.logf("WARNING: the controller now gives node IP %s, but this run uses %s; restart the gateway", resp.NodeIP, a.nodeIP)
+		a.log.Warn("the controller gives another node IP; restart the gateway", "node_ip", resp.NodeIP.String(), "in_use", a.nodeIP.String())
 	}
 	return resp, nil
 }
@@ -201,7 +201,7 @@ func (a *Agent) registerRetry(ctx context.Context) (api.RegisterGatewayResponse,
 		if errors.As(err, &se) && se.Code/100 == 4 {
 			return resp, fmt.Errorf("gateway: the controller refused registration: %w", err)
 		}
-		a.logf("register: %v (retrying)", err)
+		a.log.Warn("register failed; retrying", telemetry.Err(err))
 		select {
 		case <-ctx.Done():
 			return resp, ctx.Err()
@@ -318,7 +318,7 @@ func (a *Agent) teardown() {
 		a.undo[i]()
 	}
 	a.undo = nil
-	a.logf("stopped; host configuration removed")
+	a.log.Info("stopped; host configuration removed")
 }
 
 // indexLocked returns gateway id's n, giving it a new one on first use,
@@ -349,7 +349,7 @@ func (a *Agent) apply(p Plan) error {
 
 	for id, b := range a.backbones {
 		if _, ok := p.Backbones[id]; !ok {
-			a.logf("backbone to %s removed", id)
+			a.log.Info("backbone removed", "peer", id)
 			b.dev.Close()
 			delete(a.backbones, id)
 		}
@@ -441,7 +441,7 @@ func (a *Agent) apply(p Plan) error {
 			errs = append(errs, err)
 			continue
 		}
-		a.logf("return traffic for %s now goes through %s", vip, access)
+		a.log.Info("return route changed", "virtual_ip", vip.String(), "access", access)
 		a.ret[vip] = access
 	}
 	return errors.Join(errs...)
@@ -470,7 +470,7 @@ func (a *Agent) applyBackboneLocked(id string, want Backbone) error {
 		b = &backbone{dev: dev, name: name}
 		a.backbones[id] = b
 		port, _ := dev.ListenPort()
-		a.logf("backbone to %s on %s, listening on %d", id, name, port)
+		a.log.Info("backbone created", "peer", id, "device", name, "port", port)
 	}
 	if b.set && b.want == want {
 		return nil
@@ -506,7 +506,7 @@ func (a *Agent) applyBackboneLocked(id string, want Backbone) error {
 		return err
 	}
 	b.want, b.set = want, true
-	a.logf("backbone to %s: peer endpoint %q", id, want.Endpoint)
+	a.log.Info("backbone peer set", "peer", id, "endpoint", want.Endpoint, "initiator", initiator)
 	return nil
 }
 
@@ -527,7 +527,7 @@ func (a *Agent) setProbeTargetsLocked() error {
 		if last, err := b.dev.LastHandshake(key); err == nil && !last.IsZero() {
 			targets[id] = netip.AddrPortFrom(b.want.NodeIP, a.network.ProbePort)
 			if !b.up {
-				a.logf("backbone to %s is up", id)
+				a.log.Info("backbone up", "peer", id)
 				b.up = true
 			}
 		}
@@ -547,7 +547,7 @@ func (a *Agent) reportLoop(ctx context.Context) {
 		a.mu.Lock()
 		ids := slices.Collect(maps.Keys(a.backbones))
 		if err := a.setProbeTargetsLocked(); err != nil {
-			a.logf("probe targets: %v", err)
+			a.log.Warn("set probe targets failed", telemetry.Err(err))
 		}
 		a.mu.Unlock()
 		rep := api.LinkReport{Links: make([]api.Link, 0, len(ids))}
@@ -563,7 +563,7 @@ func (a *Agent) reportLoop(ctx context.Context) {
 			_, err = a.register(ctx)
 		}
 		if err != nil && ctx.Err() == nil {
-			a.logf("report: %v", err)
+			a.log.Warn("link report failed", telemetry.Err(err))
 		}
 	}
 }

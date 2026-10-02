@@ -14,7 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"os"
@@ -27,120 +27,139 @@ import (
 	"github.com/ngthdong/egressa/internal/cliutil"
 	"github.com/ngthdong/egressa/internal/control"
 	"github.com/ngthdong/egressa/internal/controller"
+	"github.com/ngthdong/egressa/internal/telemetry"
 )
+
+type options struct {
+	listen, stateFile, etcd          string
+	gwTokenFile, clTokenFile         string
+	clientSubnet, nodeSubnet, policy string
+	probePort                        uint
+	tlsCert, tlsKey                  string
+}
 
 func main() {
 	var (
-		showVersion  = flag.Bool("version", false, "print version and exit")
-		listen       = flag.String("listen", ":8080", "HTTP listen address")
-		stateFile    = flag.String("state-file", "", "keep state in this JSON file (default: in memory only, lost on restart)")
-		etcdEndpoint = flag.String("etcd", "", "keep state in etcd at this endpoint instead (needs a build with -tags etcd)")
-		gwTokenFile  = flag.String("gateway-token-file", "", "file holding the gateway token (default: $EGRESSA_GATEWAY_TOKEN)")
-		clTokenFile  = flag.String("client-token-file", "", "file holding the client token (default: $EGRESSA_CLIENT_TOKEN)")
-		clientSubnet = flag.String("client-subnet", "10.201.0.0/16", "client virtual IPs are allocated from here")
-		nodeSubnet   = flag.String("node-subnet", "10.200.0.0/24", "gateway node IPs are allocated from here")
-		probePort    = flag.Uint("probe-port", 51900, "UDP port gateways answer probes on")
-		policyFile   = flag.String("policy", "", "JSON policy document (cost weights, decision thresholds, flap guard) to set on start")
-		tlsCert      = flag.String("tls-cert", "", "serve HTTPS with this certificate")
-		tlsKey       = flag.String("tls-key", "", "and this key")
+		o           options
+		logs        cliutil.LogFlags
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
+	flag.StringVar(&o.listen, "listen", ":8080", "HTTP listen address")
+	flag.StringVar(&o.stateFile, "state-file", "", "keep state in this JSON file (default: in memory only, lost on restart)")
+	flag.StringVar(&o.etcd, "etcd", "", "keep state in etcd at this endpoint instead (needs a build with -tags etcd)")
+	flag.StringVar(&o.gwTokenFile, "gateway-token-file", "", "file holding the gateway token (default: $EGRESSA_GATEWAY_TOKEN)")
+	flag.StringVar(&o.clTokenFile, "client-token-file", "", "file holding the client token (default: $EGRESSA_CLIENT_TOKEN)")
+	flag.StringVar(&o.clientSubnet, "client-subnet", "10.201.0.0/16", "client virtual IPs are allocated from here")
+	flag.StringVar(&o.nodeSubnet, "node-subnet", "10.200.0.0/24", "gateway node IPs are allocated from here")
+	flag.UintVar(&o.probePort, "probe-port", 51900, "UDP port gateways answer probes on")
+	flag.StringVar(&o.policy, "policy", "", "JSON policy document (cost weights, decision thresholds, flap guard) to set on start")
+	flag.StringVar(&o.tlsCert, "tls-cert", "", "serve HTTPS with this certificate")
+	flag.StringVar(&o.tlsKey, "tls-key", "", "and this key")
+	logs.Register(flag.CommandLine)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(buildinfo.String("controller"))
 		return
 	}
-	if err := run(*listen, *stateFile, *etcdEndpoint, *gwTokenFile, *clTokenFile, *clientSubnet, *nodeSubnet, *probePort, *policyFile, *tlsCert, *tlsKey); err != nil {
-		log.Fatalf("controller: fatal: %v", err)
+	logger, err := logs.Logger("controller", "")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "controller:", err)
+		os.Exit(2)
+	}
+	if err := run(o, logger); err != nil {
+		cliutil.Fatal(logger, "controller failed", err)
 	}
 }
 
-func run(listen, stateFile, etcdEndpoint, gwTokenFile, clTokenFile, clientSubnet, nodeSubnet string, probePort uint, policyFile, tlsCert, tlsKey string) error {
+func run(o options, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cs, err := netip.ParsePrefix(clientSubnet)
+	cs, err := netip.ParsePrefix(o.clientSubnet)
 	if err != nil {
 		return fmt.Errorf("--client-subnet: %w", err)
 	}
-	ns, err := netip.ParsePrefix(nodeSubnet)
+	ns, err := netip.ParsePrefix(o.nodeSubnet)
 	if err != nil {
 		return fmt.Errorf("--node-subnet: %w", err)
 	}
-	if probePort == 0 || probePort > 65535 {
-		return fmt.Errorf("bad --probe-port %d", probePort)
+	if o.probePort == 0 || o.probePort > 65535 {
+		return fmt.Errorf("bad --probe-port %d", o.probePort)
 	}
-	gwToken, err := cliutil.Secret(gwTokenFile, "EGRESSA_GATEWAY_TOKEN")
+	gwToken, err := cliutil.Secret(o.gwTokenFile, "EGRESSA_GATEWAY_TOKEN")
 	if err != nil {
 		return err
 	}
-	clToken, err := cliutil.Secret(clTokenFile, "EGRESSA_CLIENT_TOKEN")
+	clToken, err := cliutil.Secret(o.clTokenFile, "EGRESSA_CLIENT_TOKEN")
 	if err != nil {
 		return err
 	}
 	if gwToken == "" || clToken == "" {
-		log.Printf("controller: WARNING: a gateway or client token is empty; anyone who reaches %s can use that API", listen)
+		logger.Warn("a gateway or client token is empty; anyone who reaches the API can use that part of it", "listen", o.listen)
 	}
 
 	var store control.KVStore
 	switch {
-	case etcdEndpoint != "" && stateFile != "":
+	case o.etcd != "" && o.stateFile != "":
 		return errors.New("give --etcd or --state-file, not both")
-	case etcdEndpoint != "":
-		s, closeFn, err := openEtcd(etcdEndpoint)
+	case o.etcd != "":
+		s, closeFn, err := openEtcd(o.etcd)
 		if err != nil {
 			return err
 		}
 		defer closeFn()
 		store = s
-	case stateFile != "":
-		s, err := controller.OpenFileStore(stateFile)
+	case o.stateFile != "":
+		s, err := controller.OpenFileStore(o.stateFile)
 		if err != nil {
 			return err
 		}
 		store = s
 	default:
-		log.Printf("controller: WARNING: no --state-file or --etcd; sessions are lost on restart")
+		logger.Warn("no --state-file or --etcd; sessions are lost on restart")
 		store = control.NewMemStore()
 	}
 
 	var policy *control.PolicyDocument
-	if policyFile != "" {
-		data, err := os.ReadFile(policyFile)
+	if o.policy != "" {
+		data, err := os.ReadFile(o.policy)
 		if err != nil {
 			return err
 		}
 		doc := control.DefaultPolicyDocument
 		if err := json.Unmarshal(data, &doc); err != nil {
-			return fmt.Errorf("--policy %s: %w", policyFile, err)
+			return fmt.Errorf("--policy %s: %w", o.policy, err)
 		}
 		policy = &doc
 	}
 
 	srv, err := controller.New(ctx, controller.Config{
 		Store: store, GatewayToken: gwToken, ClientToken: clToken, Policy: policy,
-		Network: api.Network{ClientSubnet: cs, NodeSubnet: ns, ProbePort: uint16(probePort)},
+		Network: api.Network{ClientSubnet: cs, NodeSubnet: ns, ProbePort: uint16(o.probePort)},
+		Logger:  logger,
 	})
 	if err != nil {
 		return err
 	}
 	go srv.Run(ctx)
 
-	hs := &http.Server{Addr: listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	hs := &http.Server{Addr: o.listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = hs.Shutdown(sctx)
 	}()
-	log.Printf("controller: starting (%s), listening on %s", buildinfo.String("controller"), listen)
-	if tlsCert != "" {
-		err = hs.ListenAndServeTLS(tlsCert, tlsKey)
+	logger.Info("starting", "build", buildinfo.String("controller"), "listen", o.listen,
+		"gateway_token", telemetry.Secret(gwToken), "client_token", telemetry.Secret(clToken))
+	if o.tlsCert != "" {
+		err = hs.ListenAndServeTLS(o.tlsCert, o.tlsKey)
 	} else {
 		err = hs.ListenAndServe()
 	}
 	if errors.Is(err, http.ErrServerClosed) {
-		log.Printf("controller: shut down")
+		logger.Info("shut down")
 		return nil
 	}
 	return err

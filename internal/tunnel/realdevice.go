@@ -22,6 +22,8 @@ type RealConfig struct {
 	SessionID       uint64
 	Epoch           uint32
 	OnSessionPacket func(wire.SessionHeader)
+	// Admit is as in Config.
+	Admit func(wire.SessionHeader) bool
 }
 
 // RealDevice wraps a wireguard-go device backed by a real, OS-level TUN
@@ -30,6 +32,7 @@ type RealDevice struct {
 	peerManager
 	tun  tun.Device
 	name string
+	bind *sessionBind
 }
 
 func NewReal(cfg RealConfig) (*RealDevice, error) {
@@ -50,8 +53,9 @@ func NewReal(cfg RealConfig) (*RealDevice, error) {
 	}
 
 	wrappedBind := newSessionBind(conn.NewDefaultBind(), cfg.SessionID, cfg.Epoch, cfg.OnSessionPacket)
+	wrappedBind.admit = cfg.Admit
 
-	logger := device.NewLogger(device.LogLevelSilent, "")
+	logger := newLogger(actualName)
 	dev := device.NewDevice(realTUN, wrappedBind, logger)
 
 	uapi := fmt.Sprintf("private_key=%s\nlisten_port=%d\n", Hex(cfg.PrivateKey), cfg.ListenPort)
@@ -65,8 +69,12 @@ func NewReal(cfg RealConfig) (*RealDevice, error) {
 		return nil, fmt.Errorf("tunnel: bring device up: %w", err)
 	}
 
-	return &RealDevice{peerManager: peerManager{dev: dev}, tun: realTUN, name: actualName}, nil
+	return &RealDevice{peerManager: peerManager{dev: dev}, tun: realTUN, name: actualName, bind: wrappedBind}, nil
 }
+
+// SetEpoch changes the epoch stamped into every packet sent from now on,
+// after a migration commits.
+func (d *RealDevice) SetEpoch(epoch uint32) { d.bind.setEpoch(epoch) }
 
 func (d *RealDevice) Name() string {
 	return d.name

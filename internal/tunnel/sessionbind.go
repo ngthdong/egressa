@@ -15,15 +15,25 @@ import (
 type sessionBind struct {
 	real      conn.Bind
 	sessionID uint64
-	epoch     uint32
+	epoch     atomic.Uint32
 	seq       atomic.Uint64
 
 	onRecv func(wire.SessionHeader)
+	// admit, if set, decides whether an inbound datagram is delivered to
+	// WireGuard at all; a datagram it rejects is dropped before
+	// decryption. Gateways use it to fence packets stamped with an epoch
+	// older than the session's current one.
+	admit func(wire.SessionHeader) bool
 }
 
 func newSessionBind(real conn.Bind, sessionID uint64, epoch uint32, onRecv func(wire.SessionHeader)) *sessionBind {
-	return &sessionBind{real: real, sessionID: sessionID, epoch: epoch, onRecv: onRecv}
+	b := &sessionBind{real: real, sessionID: sessionID, onRecv: onRecv}
+	b.epoch.Store(epoch)
+	return b
 }
+
+// setEpoch changes the epoch stamped into every datagram sent from now on.
+func (b *sessionBind) setEpoch(epoch uint32) { b.epoch.Store(epoch) }
 
 func (b *sessionBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	fns, actualPort, err := b.real.Open(port)
@@ -54,6 +64,9 @@ func (b *sessionBind) wrapReceiveFunc(real conn.ReceiveFunc) conn.ReceiveFunc {
 			if err != nil {
 				continue
 			}
+			if b.admit != nil && !b.admit(h) {
+				continue
+			}
 			if b.onRecv != nil {
 				b.onRecv(h)
 			}
@@ -76,7 +89,7 @@ func (b *sessionBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			Type:       wire.PacketTypeData,
 			Direction:  wire.DirUpstream,
 			SessionID:  b.sessionID,
-			Epoch:      b.epoch,
+			Epoch:      b.epoch.Load(),
 			SessionSeq: b.seq.Add(1),
 		}
 		out := make([]byte, wire.SessionHeaderSize+len(buf))

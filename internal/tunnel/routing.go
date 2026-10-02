@@ -13,6 +13,9 @@ type RouteInfo struct {
 	Interface string
 }
 
+// CurrentRoute reports the route the kernel would use to reach dst.
+func CurrentRoute(dst netip.Addr) (RouteInfo, error) { return currentRoute(dst) }
+
 func currentRoute(dst netip.Addr) (RouteInfo, error) {
 	out, err := exec.Command("ip", "route", "get", dst.String()).Output()
 	if err != nil {

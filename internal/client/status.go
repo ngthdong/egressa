@@ -2,12 +2,10 @@ package client
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/ngthdong/egressa/internal/api"
@@ -61,8 +59,7 @@ func (st Status) Live(now time.Time, maxAge time.Duration) bool {
 	if st.PID <= 0 || now.Sub(st.Updated) > maxAge {
 		return false
 	}
-	err := syscall.Kill(st.PID, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return processAlive(st.PID)
 }
 
 func writeStatus(path string, st Status) error {

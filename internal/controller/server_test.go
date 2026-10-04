@@ -358,3 +358,25 @@ func TestOpenFileStore_Corrupt(t *testing.T) {
 }
 
 func writeFile(path, s string) error { return os.WriteFile(path, []byte(s), 0o600) }
+
+func TestListGateways(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	e.register(t, "sg", both, "192.0.2.12:51820")
+	e.register(t, "eu", control.RoleEgress, "192.0.2.13:51820")
+	gws, err := e.cl.Gateways(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gws) != 2 || gws[0].ID != "eu" || gws[1].ID != "sg" || !gws[1].Alive || gws[1].Endpoint != "192.0.2.12:51820" {
+		t.Fatalf("gateways %+v", gws)
+	}
+	bad, _ := api.NewClient(e.url, "wrong")
+	if _, err := bad.Gateways(ctx); statusCode(err) != http.StatusUnauthorized {
+		t.Errorf("wrong client token: %v", err)
+	}
+	// The gateway token is not the client token.
+	if _, err := e.gw.Gateways(ctx); statusCode(err) != http.StatusUnauthorized {
+		t.Errorf("gateway token accepted for the client route: %v", err)
+	}
+}

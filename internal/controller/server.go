@@ -210,6 +210,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/gateways/{id}", s.gatewayAuth(s.registerGateway))
 	mux.HandleFunc("POST /v1/gateways/{id}/links", s.gatewayAuth(s.reportLinks))
 	mux.HandleFunc("GET /v1/gateway-state", s.gatewayAuth(s.gatewayState))
+	mux.HandleFunc("GET /v1/gateways", s.clientAuth(s.listGateways))
 	mux.HandleFunc("POST /v1/sessions", s.createSession)
 	mux.HandleFunc("GET /v1/sessions/{id}/state", s.sessionAuth(s.clientState))
 	mux.HandleFunc("POST /v1/sessions/{id}/migrate", s.sessionAuth(s.migrate))
@@ -250,6 +251,32 @@ func (s *Server) gatewayAuth(h http.HandlerFunc) http.HandlerFunc {
 		}
 		h(w, r)
 	}
+}
+
+// clientAuth admits requests carrying the client token, for what a
+// client may ask before it has a session.
+func (s *Server) clientAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !tokenOK(s.cfg.ClientToken, bearer(r)) {
+			writeErr(w, http.StatusUnauthorized, "bad client token")
+			return
+		}
+		h(w, r)
+	}
+}
+
+// listGateways lists the gateways, so a client can check a gateway's
+// name before opening a session with it as egress.
+func (s *Server) listGateways(w http.ResponseWriter, r *http.Request) {
+	_, gws, err := s.snapshot(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	for i := range gws {
+		gws[i].BackbonePorts = nil
+	}
+	writeJSON(w, http.StatusOK, gws)
 }
 
 func hashSecret(secret string) string {

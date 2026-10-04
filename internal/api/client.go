@@ -130,6 +130,14 @@ func (c *Client) GatewayState(ctx context.Context, after uint64, wait time.Durat
 	return out, err
 }
 
+// Gateways lists the registered gateways, authenticated with the client
+// token.
+func (c *Client) Gateways(ctx context.Context) ([]Gateway, error) {
+	var out []Gateway
+	err := c.do(ctx, http.MethodGet, "/v1/gateways", c.token, nil, &out)
+	return out, err
+}
+
 // CreateSession opens (or reopens) a session.
 func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (CreateSessionResponse, error) {
 	var out CreateSessionResponse

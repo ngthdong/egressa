@@ -258,7 +258,7 @@ func reexec(t *testing.T) {
 	}
 
 	bin := t.TempDir()
-	build := exec.Command("go", "build", "-o", bin+"/", "./cmd/controller", "./cmd/gateway", "./cmd/client")
+	build := exec.Command("go", "build", "-o", bin+"/", "./cmd/controller", "./cmd/gateway", "./cmd/client", "./cmd/egressa")
 	build.Dir = filepath.Dir(strings.TrimSpace(string(root)))
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build the binaries: %v\n%s", err, out)

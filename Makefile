@@ -10,7 +10,7 @@ LDFLAGS := -X '$(MODULE)/internal/buildinfo.Version=$(GIT_TAG)' \
            -X '$(MODULE)/internal/buildinfo.Commit=$(GIT_COMMIT)' \
            -X '$(MODULE)/internal/buildinfo.BuildTime=$(BUILD_TIME)'
 
-BINARIES := client gateway controller vpnctl
+BINARIES := egressa client gateway controller vpnctl
 
 .PHONY: all
 all: build

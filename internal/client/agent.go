@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -60,6 +61,9 @@ type Config struct {
 	Metrics *telemetry.ClientMetrics
 	// Tracer, if set, logs a span for each phase of a migration.
 	Tracer *telemetry.Tracer
+	// StatusFile, if set, is rewritten with the client's Status after
+	// every decision pass, and removed when the client stops.
+	StatusFile string
 }
 
 // pendingMigration is a move the client has decided on and asked the
@@ -240,6 +244,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); _ = a.mon.Run(runCtx) }()
 	go func() { defer wg.Done(); a.pollLoop(runCtx, st.Version) }()
 
+	if a.cfg.StatusFile != "" {
+		defer func() { _ = os.Remove(a.cfg.StatusFile) }()
+	}
 	a.log.InfoContext(a.logCtx(), "ready")
 	tick := time.NewTicker(decideInterval)
 	defer tick.Stop()
@@ -484,6 +491,7 @@ func (a *Agent) decideOnce(ctx context.Context) {
 	a.mu.Unlock()
 	a.cfg.Metrics.Decision(dec.Outcome)
 	a.publish(sess, accessIDs, paths, dead, dec)
+	a.writeStatus(sess, paths, dead, dec)
 	if !dec.Migrate {
 		return
 	}
@@ -515,6 +523,21 @@ func (a *Agent) decideOnce(ctx context.Context) {
 	default:
 		commit.End(nil)
 		a.adopt(next)
+	}
+}
+
+// writeStatus rewrites the status file, if there is one.
+func (a *Agent) writeStatus(sess api.Session, paths []Path, dead bool, dec Decision) {
+	if a.cfg.StatusFile == "" {
+		return
+	}
+	a.mu.Lock()
+	gws := a.gateways
+	a.mu.Unlock()
+	st := statusOf(sess, gws, paths, dead, a.controllerUp.Load(), dec)
+	st.Started, st.Updated = a.start, time.Now()
+	if err := writeStatus(a.cfg.StatusFile, st); err != nil {
+		a.log.Warn("writing the status file failed", "path", a.cfg.StatusFile, telemetry.Err(err))
 	}
 }
 

@@ -7,9 +7,9 @@ Egressa measures the quality of each segment of a path with active UDP probes se
 ## At a glance
 
 ![measurement](images/measurement.png)
-**Client:** Probes all access gateways, builds paths from segments, computes cost and LCB(Δ), decides every 500 ms.
-**Gateway:** Echo - returns probes, measures backbone to other gateways.
-**Controller:**: Keeps the latest reports, adds Staleness on relay, computes nothing on them.
+- **Client:** Probes all access gateways, builds paths from segments, computes cost and LCB(Δ), decides every 500 ms.
+- **Gateway:** Echo - returns probes, measures backbone to other gateways.
+- **Controller:**: Keeps the latest reports, adds Staleness on relay, computes nothing on them.
 
 ---
 

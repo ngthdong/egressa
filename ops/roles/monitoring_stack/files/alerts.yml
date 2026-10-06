@@ -1,0 +1,94 @@
+groups:
+  - name: meta
+    rules:
+      - alert: Watchdog
+        expr: vector(1)
+        labels: { severity: none }
+        annotations:
+          summary: Always firing; used as heartbeat to an external service
+
+  - name: availability
+    rules:
+      - alert: InstanceDown
+        expr: up{job="node"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }} is unreachable (node_exporter not scraped for 2m)"
+      - alert: MonitoringComponentDown
+        expr: up{job!="node"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }} is down on {{ $labels.instance }}"
+      - alert: SystemdUnitNotActive
+        expr: node_systemd_unit_state{state="active", name=~"(ssh|fail2ban|auditd|ufw|chrony|docker|egressa-gateway|egressa-controller).service"} == 0
+        for: 3m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.name }} is not active on {{ $labels.instance }}"
+
+  - name: resources
+    rules:
+      - alert: HighCPU
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "CPU above 85% on {{ $labels.instance }} for 10m"
+      - alert: HighMemory
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 90
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Memory above 90% on {{ $labels.instance }}"
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes{fstype=~"ext4|xfs"} / node_filesystem_size_bytes{fstype=~"ext4|xfs"}) * 100 < 15
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} has under 15% free"
+      - alert: DiskWillFillIn24h
+        expr: predict_linear(node_filesystem_avail_bytes{fstype=~"ext4|xfs"}[6h], 24 * 3600) < 0
+        for: 1h
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} will fill within 24h"
+      - alert: ClockSkew
+        expr: abs(node_timex_offset_seconds) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Clock offset above 50ms on {{ $labels.instance }}"
+      - alert: ConntrackNearFull
+        expr: node_nf_conntrack_entries / node_nf_conntrack_entries_limit > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "conntrack table above 80% on {{ $labels.instance }} (VPN gateways forward many flows)"
+
+  - name: security
+    rules:
+      - alert: SshBruteForce
+        expr: ops_fail2ban_banned{jail="sshd"} > 20
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 20 IPs banned in the sshd jail on {{ $labels.instance }}"
+      - alert: RebootRequired
+        expr: ops_reboot_required == 1
+        for: 72h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} has needed a reboot for 3 days (kernel/security updates)"
+      - alert: LynisHardeningLow
+        expr: ops_lynis_hardening_index < 65
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "Lynis hardening index is {{ $value }} on {{ $labels.instance }}"
+      - alert: LynisReportStale
+        expr: time() - ops_lynis_report_timestamp_seconds > 15 * 24 * 3600
+        labels: { severity: warning }
+        annotations:
+          summary: "No Lynis audit for 15 days on {{ $labels.instance }}"

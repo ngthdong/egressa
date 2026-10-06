@@ -1,0 +1,63 @@
+# Managed by Ansible (ops/roles/monitoring_stack)
+# Ports are published on 127.0.0.1 ONLY: Docker bypasses UFW, so never publish on 0.0.0.0.
+# Reach Grafana via: ssh -L 3000:127.0.0.1:3000 {{ admin_user }}@<controller>
+name: monitoring
+
+services:
+  prometheus:
+    image: {{ prometheus_image }}
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time={{ prometheus_retention }}
+    ports: ["127.0.0.1:9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    security_opt: ["no-new-privileges:true"]
+    networks: [monitoring]
+
+  alertmanager:
+    image: {{ alertmanager_image }}
+    restart: unless-stopped
+    ports: ["127.0.0.1:9093:9093"]
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+{% if telegram_enabled | bool %}
+      - ./secrets/telegram_token:/etc/alertmanager/secrets/telegram_token:ro
+{% endif %}
+      - ./secrets/heartbeat_url:/etc/alertmanager/secrets/heartbeat_url:ro
+      - alertmanager_data:/alertmanager
+    security_opt: ["no-new-privileges:true"]
+    networks: [monitoring]
+
+  grafana:
+    image: {{ grafana_image }}
+    restart: unless-stopped
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /etc/grafana/secrets/admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./secrets/grafana_admin_password:/etc/grafana/secrets/admin_password:ro
+      - grafana_data:/var/lib/grafana
+    security_opt: ["no-new-privileges:true"]
+    networks: [monitoring]
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+
+networks:
+  monitoring:
+    ipam:
+      config:
+        - subnet: {{ docker_monitoring_subnet }}

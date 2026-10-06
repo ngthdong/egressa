@@ -1,0 +1,37 @@
+---
+- name: Install base packages
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, gnupg, jq, rsync, acl, chrony, unattended-upgrades, apt-transport-https]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Set timezone
+  community.general.timezone:
+    name: "{{ timezone }}"
+
+- name: Enable chrony
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true
+
+- name: Automatic security updates (no automatic reboot)
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+
+- name: Kernel / network hardening (sysctl)
+  ansible.builtin.template:
+    src: 99-ops-hardening.conf.j2
+    dest: /etc/sysctl.d/99-ops-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sysctl

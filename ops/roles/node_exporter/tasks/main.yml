@@ -1,0 +1,56 @@
+---
+- name: Install node_exporter (Ubuntu package)
+  ansible.builtin.apt:
+    name: prometheus-node-exporter
+    state: present
+
+- name: Textfile collector directory
+  ansible.builtin.file:
+    path: /var/lib/node_exporter/textfile
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: node_exporter arguments
+  ansible.builtin.copy:
+    dest: /etc/default/prometheus-node-exporter
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible. Access is restricted by UFW (Prometheus only).
+      ARGS="--web.listen-address=:{{ node_exporter_port }} --collector.textfile.directory=/var/lib/node_exporter/textfile --collector.systemd --collector.systemd.unit-include=(ssh|fail2ban|auditd|ufw|chrony|docker|egressa-gateway|egressa-controller).service"
+  notify: Restart node_exporter
+
+- name: Metrics script (fail2ban, updates, reboot, lynis)
+  ansible.builtin.copy:
+    src: ops-metrics.sh
+    dest: /usr/local/sbin/ops-metrics
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Metrics systemd units
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [ops-metrics.service, ops-metrics.timer]
+  notify: Reload systemd
+
+- name: Flush so units are known
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable node_exporter and metrics timer
+  ansible.builtin.service:
+    name: "{{ item.name }}"
+    state: started
+    enabled: true
+  loop:
+    - { name: prometheus-node-exporter }
+    - { name: ops-metrics.timer }
+  loop_control:
+    label: "{{ item.name }}"

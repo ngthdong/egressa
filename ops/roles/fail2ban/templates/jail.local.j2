@@ -1,0 +1,25 @@
+# Managed by Ansible (ops/roles/fail2ban)
+[DEFAULT]
+ignoreip = {{ fail2ban_ignoreip | join(' ') }}
+bantime = {{ fail2ban_bantime }}
+findtime = {{ fail2ban_findtime }}
+maxretry = {{ fail2ban_maxretry }}
+backend = systemd
+banaction = ufw
+# repeat offenders get longer bans (1h, 2h, 4h ... capped at 1 week)
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 1w
+
+[sshd]
+enabled = true
+port = {{ ssh_port }}
+mode = aggressive
+
+[recidive]
+enabled = true
+backend = auto
+logpath = /var/log/fail2ban.log
+bantime = 1w
+findtime = 1d
+maxretry = 3

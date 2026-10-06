@@ -1,0 +1,94 @@
+name: ops-cd
+# On every merge to main: build the Egressa binaries, then apply ops/ (hardening, monitoring)
+# and deploy the binaries with Ansible. Servers never clone or build anything.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: apply or check (dry-run)
+        type: choice
+        options: [apply, check]
+        default: check
+      limit:
+        description: "Optional --limit (e.g. vpn-gw1)"
+        type: string
+        default: ""
+permissions:
+  contents: read
+# Never run two deployments at once, never cancel one half-way.
+concurrency:
+  group: ops-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Optionally add "required reviewers" to this environment for a manual gate.
+    environment: production
+    defaults:
+      run:
+        working-directory: ops
+    env:
+      GO_VERSION: "1.26.4"           # keep in sync with egressa-ci
+      EGRESSA_GOARCH: amd64          # must match `uname -m` on the servers (x86_64 = amd64)
+      ANSIBLE_REMOTE_USER: deploy
+      ANSIBLE_FORCE_COLOR: "1"
+      CONTROLLER_IP: ${{ secrets.CONTROLLER_IP }}
+      GATEWAY1_IP: ${{ secrets.GATEWAY1_IP }}
+      GATEWAY2_IP: ${{ secrets.GATEWAY2_IP }}
+      CONTROLLER_URL: ${{ secrets.CONTROLLER_URL }}
+      EGRESSA_GATEWAY_TOKEN: ${{ secrets.EGRESSA_GATEWAY_TOKEN }}
+      EGRESSA_CLIENT_TOKEN: ${{ secrets.EGRESSA_CLIENT_TOKEN }}
+      CONTROLLER_TLS_CERT: ${{ secrets.CONTROLLER_TLS_CERT }}
+      CONTROLLER_TLS_KEY: ${{ secrets.CONTROLLER_TLS_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+      HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
+      MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'apply' }}
+      LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.limit || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build Egressa binaries (controller, gateway)
+        run: scripts/build-artifacts.sh
+      - name: Install Ansible
+        run: |
+          pip install "ansible-core>=2.16,<2.18"
+          ansible-galaxy collection install -r requirements.yml
+      - name: Prepare SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          echo "ANSIBLE_PRIVATE_KEY_FILE=$HOME/.ssh/deploy_key" >> "$GITHUB_ENV"
+      - name: Dry run (--check --diff)
+        run: |
+          args=(); [ -n "$LIMIT" ] && args+=(--limit "$LIMIT")
+          ansible-playbook playbooks/site.yml --check --diff "${args[@]}"
+        continue-on-error: true   # check mode can't simulate first-time package installs
+      - name: "Apply (infra: canary gateway first; app: controller, then gateways one by one)"
+        if: env.MODE == 'apply'
+        run: |
+          args=(); [ -n "$LIMIT" ] && args+=(--limit "$LIMIT")
+          ansible-playbook playbooks/site.yml --diff "${args[@]}"
+      - name: Verify
+        if: env.MODE == 'apply'
+        run: ansible-playbook playbooks/verify.yml
+      - name: Remove key
+        if: always()
+        run: shred -u ~/.ssh/deploy_key || true

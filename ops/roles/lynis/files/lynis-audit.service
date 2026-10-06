@@ -1,0 +1,8 @@
+[Unit]
+Description=Lynis security audit
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/lynis audit system --cronjob
+ExecStartPost=/usr/local/sbin/ops-metrics
+Nice=10

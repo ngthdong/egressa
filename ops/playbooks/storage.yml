@@ -1,0 +1,9 @@
+---
+# MANUAL ONLY (never run from CI): changes disk layout / fstab.
+#   ansible-playbook playbooks/storage.yml -e storage_enabled=true --limit vpn-gw1 -D
+- name: LVM layout and /etc/fstab
+  hosts: all
+  become: true
+  serial: 1
+  roles:
+    - { role: storage, tags: [storage] }

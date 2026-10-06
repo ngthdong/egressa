@@ -1,0 +1,77 @@
+---
+- name: Refuse to continue without real SSH keys (lock-out protection)
+  ansible.builtin.assert:
+    that:
+      - ssh_authorized_keys[admin_user] | default([]) | length > 0
+      - ssh_authorized_keys[deploy_user] | default([]) | length > 0
+      - ssh_authorized_keys | to_json is not search('REPLACE')
+    fail_msg: >-
+      Put real public keys in inventory/group_vars/all.yml (ssh_authorized_keys)
+      before applying: password login is disabled by this role.
+
+- name: Ensure admin user exists and is in sudo
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    groups: sudo
+    append: true
+    state: present
+
+- name: Ensure deploy user exists (CI/CD)
+  ansible.builtin.user:
+    name: "{{ deploy_user }}"
+    shell: /bin/bash
+    create_home: true
+    password_lock: true
+    state: present
+
+- name: Passwordless sudo for deploy user (needed by Ansible in CI)
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/90-{{ deploy_user }}"
+    content: "{{ deploy_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Install authorized keys
+  ansible.posix.authorized_key:
+    user: "{{ item.0.key }}"
+    key: "{{ item.1 }}"
+    state: present
+  loop: "{{ ssh_authorized_keys | dict2items | subelements('value') }}"
+  loop_control:
+    label: "{{ item.0.key }}"
+
+- name: Find drop-in files (cloud-init often re-enables PasswordAuthentication)
+  ansible.builtin.find:
+    paths: /etc/ssh/sshd_config.d
+    patterns: "*.conf"
+  register: sshd_dropins
+
+- name: Remove drop-ins so this repo is the single source of truth
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ sshd_dropins.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  notify: Restart sshd
+
+- name: Deploy sshd_config (validated with sshd -t before install)
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/sshd -t -f %s
+    backup: true
+  notify: Restart sshd
+
+- name: Apply sshd changes now and make sure we can still connect
+  ansible.builtin.meta: flush_handlers
+
+- name: Reconnect check
+  ansible.builtin.wait_for_connection:
+    delay: 2
+    timeout: 60

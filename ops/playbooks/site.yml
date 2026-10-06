@@ -1,0 +1,54 @@
+---
+- name: Preflight
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Check connectivity
+      ansible.builtin.ping:
+
+# ---- Phase 1: server hardening + monitoring (canary = first gateway) ----
+- name: Gateways - infrastructure (rolling, one at a time)
+  hosts: gateways
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - { role: base, tags: [base] }
+    - { role: ssh_hardening, tags: [ssh] }
+    - { role: ufw, tags: [ufw] }
+    - { role: fail2ban, tags: [fail2ban] }
+    - { role: auditd, tags: [auditd] }
+    - { role: node_exporter, tags: [monitoring, node_exporter] }
+    - { role: lynis, tags: [lynis] }
+
+- name: Controller - infrastructure
+  hosts: controller
+  become: true
+  any_errors_fatal: true
+  roles:
+    - { role: base, tags: [base] }
+    - { role: ssh_hardening, tags: [ssh] }
+    - { role: ufw, tags: [ufw] }
+    - { role: fail2ban, tags: [fail2ban] }
+    - { role: auditd, tags: [auditd] }
+    - { role: node_exporter, tags: [monitoring, node_exporter] }
+    - { role: lynis, tags: [lynis] }
+    - { role: monitoring_stack, tags: [monitoring, stack] }
+
+# ---- Phase 2: Egressa application. Controller FIRST (gateways register with it),
+# ---- then gateways one at a time so clients can migrate away from the one restarting.
+- name: Egressa controller
+  hosts: controller
+  become: true
+  any_errors_fatal: true
+  roles:
+    - { role: egressa, tags: [app, egressa], when: egressa_enabled | bool }
+
+- name: Egressa gateways (rolling)
+  hosts: gateways
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - { role: egressa, tags: [app, egressa], when: egressa_enabled | bool }

@@ -1,0 +1,72 @@
+---
+- name: Verify hardening and monitoring state
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Effective sshd settings
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: sshd_t
+      changed_when: false
+
+    - name: SSH is key-only, no root
+      ansible.builtin.assert:
+        that:
+          - "'passwordauthentication no' in sshd_t.stdout"
+          - "'permitrootlogin no' in sshd_t.stdout"
+          - "'pubkeyauthentication yes' in sshd_t.stdout"
+          - "('port ' ~ ssh_port) in sshd_t.stdout"
+
+    - name: UFW status
+      ansible.builtin.command: ufw status verbose
+      register: ufw_s
+      changed_when: false
+
+    - name: UFW active with default deny incoming
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_s.stdout"
+          - "'deny (incoming)' in ufw_s.stdout"
+
+    - name: fail2ban sshd jail
+      ansible.builtin.command: fail2ban-client status sshd
+      changed_when: false
+
+    - name: auditd rules loaded
+      ansible.builtin.command: auditctl -l
+      register: audit_l
+      changed_when: false
+      failed_when: "'No rules' in audit_l.stdout"
+
+    - name: node_exporter responds locally
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
+        return_content: false
+      become: false
+
+    - name: Egressa service is active
+      ansible.builtin.command: "systemctl is-active egressa-{{ 'controller' if 'controller' in group_names else 'gateway' }}"
+      changed_when: false
+      when: egressa_enabled | bool
+
+    - name: Controller stack health
+      when: "'controller' in group_names"
+      block:
+        - name: Prometheus / Alertmanager / Grafana ready
+          ansible.builtin.uri:
+            url: "{{ item }}"
+          loop:
+            - http://127.0.0.1:9090/-/ready
+            - http://127.0.0.1:9093/-/ready
+            - http://127.0.0.1:3000/api/health
+          become: false
+
+        - name: No node target is down
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:9090/api/v1/query?query=count(up%7Bjob%3D%22node%22%7D%3D%3D0)"
+            return_content: true
+          register: down
+          until: down.json.data.result | length == 0
+          retries: 12
+          delay: 10
+          become: false

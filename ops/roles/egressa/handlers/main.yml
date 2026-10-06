@@ -1,0 +1,10 @@
+---
+# Order matters: handlers run in the order they are defined here.
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart egressa service
+  ansible.builtin.service:
+    name: "egressa-{{ egressa_component }}"
+    state: restarted

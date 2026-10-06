@@ -1,0 +1,29 @@
+---
+- name: Install lynis
+  ansible.builtin.apt:
+    name: lynis
+    state: present
+
+- name: Lynis systemd units (weekly audit)
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [lynis-audit.service, lynis-audit.timer]
+  notify: Reload systemd
+
+- name: Flush so units are known
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable weekly lynis timer
+  ansible.builtin.service:
+    name: lynis-audit.timer
+    state: started
+    enabled: true
+
+- name: First audit in the background (only if there is no report yet)
+  ansible.builtin.command:
+    cmd: systemctl start --no-block lynis-audit.service
+    creates: /var/log/lynis-report.dat

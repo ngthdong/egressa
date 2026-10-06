@@ -1,0 +1,28 @@
+# Managed by Ansible (ops/roles/egressa)
+[Unit]
+Description=Egressa controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ egressa_user }}
+Group={{ egressa_user }}
+EnvironmentFile=/etc/egressa/controller.env
+ExecStart=/opt/egressa/current/controller --listen :{{ egressa_controller_port }} --state-file /var/lib/egressa/controller.json --tls-cert /etc/egressa/tls/cert.pem --tls-key /etc/egressa/tls/key.pem{% if egressa_policy_src | length > 0 %} --policy /etc/egressa/policy.json{% endif %}
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+StateDirectory=egressa
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

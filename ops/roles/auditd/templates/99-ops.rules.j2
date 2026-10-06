@@ -1,0 +1,61 @@
+## Managed by Ansible (ops/roles/auditd)
+-D
+-b 8192
+-f 1
+
+## Identity and privilege
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+
+## SSH
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+-w /root/.ssh/ -p wa -k ssh_keys
+{% for u in ssh_allow_users %}
+-w /home/{{ u }}/.ssh/ -p wa -k ssh_keys
+{% endfor %}
+
+## Security tooling and system config
+-w /etc/ufw/ -p wa -k firewall
+-w /etc/fail2ban/ -p wa -k fail2ban
+-w /etc/audit/ -p wa -k audit_config
+-w /etc/sysctl.conf -p wa -k sysctl
+-w /etc/sysctl.d/ -p wa -k sysctl
+-w /etc/netplan/ -p wa -k network
+-w /etc/hosts -p wa -k network
+-a always,exit -F arch=b64 -S sethostname,setdomainname -k network
+
+## Time changes
+-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time_change
+
+## Kernel modules
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
+
+## setuid/setgid execution that ends up as root
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k priv_exec
+
+## File deletion by real users
+-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -k delete
+
+## Login records
+-w /var/log/faillog -p wa -k logins
+-w /var/log/lastlog -p wa -k logins
+
+{% if 'controller' in group_names %}
+## Docker (controller)
+-w /usr/bin/docker -p x -k docker
+-w /etc/docker/ -p wa -k docker
+-w {{ monitoring_dir }}/ -p wa -k monitoring_config
+{% endif %}
+{% for p in audit_extra_watch_paths %}
+-w {{ p }} -p wa -k vpn_config
+{% endfor %}
+{% if audit_immutable %}
+
+## Immutable: changing rules requires a reboot
+-e 2
+{% endif %}

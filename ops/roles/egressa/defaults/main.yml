@@ -1,0 +1,7 @@
+---
+egressa_component: "{{ 'controller' if 'controller' in group_names else 'gateway' }}"
+egressa_user: egressa                  # controller only; the gateway needs root
+egressa_releases_keep: 3
+egressa_roles: "access,egress"         # gateway --role
+egressa_uplink: "{{ ansible_default_ipv4.interface | default('eth0') }}"
+egressa_policy_src: ""                 # optional path to a policy.json on the machine running Ansible

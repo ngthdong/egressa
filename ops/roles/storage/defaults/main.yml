@@ -1,0 +1,16 @@
+---
+storage_enabled: false
+# Volume group that already has FREE space (check with: sudo vgs). If you add a new disk
+# (e.g. /dev/vdb) list it in storage_pvs so the role creates/extends the VG.
+storage_vg: ""
+storage_pvs: []
+storage_nofail: true      # boot even if a volume is missing (safer on a VPS without console)
+
+# Adjust sizes to the VG's free space. /var is disabled: move it only in a maintenance
+# window (Docker data lives under /var/lib/docker on the controller).
+storage_lvs:
+  - { name: var_log,       mount: /var/log,       size: 3g, opts: "defaults,nodev,nosuid,noexec", mode: "0755", enabled: true, stop_services: [rsyslog] }
+  - { name: var_log_audit, mount: /var/log/audit, size: 2g, opts: "defaults,nodev,nosuid,noexec", mode: "0700", enabled: true, stop_services: [auditd] }
+  - { name: tmp,           mount: /tmp,           size: 2g, opts: "defaults,nodev,nosuid,noexec", mode: "1777", enabled: true }
+  - { name: home,          mount: /home,          size: 3g, opts: "defaults,nodev,nosuid",        mode: "0755", enabled: true }
+  - { name: var,           mount: /var,           size: 8g, opts: "defaults,nodev,nosuid",        mode: "0755", enabled: false }

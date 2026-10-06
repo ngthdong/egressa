@@ -1,0 +1,111 @@
+---
+- name: Required secrets are present (set them as GitHub Secrets / env vars)
+  ansible.builtin.assert:
+    that:
+      - not (telegram_enabled | bool) or telegram_bot_token | length > 0
+      - not (telegram_enabled | bool) or telegram_chat_id | length > 0
+      - grafana_admin_password | length >= 12
+    fail_msg: >-
+      Missing TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID or GRAFANA_ADMIN_PASSWORD (min 12 chars).
+  no_log: true
+
+- name: Docker apt key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+    filename: docker
+    state: present
+
+- name: Install Docker Engine and Compose plugin
+  ansible.builtin.apt:
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin]
+    state: present
+    update_cache: true
+
+- name: Docker daemon settings
+  ansible.builtin.copy:
+    src: daemon.json
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart docker
+
+- name: Enable Docker
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ monitoring_dir }}"
+    - "{{ monitoring_dir }}/prometheus"
+    - "{{ monitoring_dir }}/alertmanager"
+    - "{{ monitoring_dir }}/grafana/provisioning/datasources"
+    - "{{ monitoring_dir }}/secrets"
+
+- name: Secret files (readable only by the container user that needs them)
+  ansible.builtin.copy:
+    dest: "{{ monitoring_dir }}/secrets/{{ item.name }}"
+    content: "{{ item.value }}"
+    owner: "{{ item.uid }}"
+    group: "{{ item.uid }}"
+    mode: "0400"
+  loop:
+    - { name: telegram_token, value: "{{ telegram_bot_token }}", uid: 65534 }
+    - { name: heartbeat_url, value: "{{ healthchecks_ping_url if healthchecks_ping_url | length > 0 else 'unused' }}", uid: 65534 }
+    - { name: grafana_admin_password, value: "{{ grafana_admin_password }}", uid: 472 }
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  notify: Restart monitoring stack
+
+- name: Config files (templates)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ monitoring_dir }}/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: compose.yml.j2, dest: compose.yml }
+    - { src: prometheus.yml.j2, dest: prometheus/prometheus.yml }
+    - { src: alertmanager.yml.j2, dest: alertmanager/alertmanager.yml }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: Restart monitoring stack
+
+- name: Config files (static)
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ monitoring_dir }}/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: alerts.yml, dest: prometheus/alerts.yml }
+    - { src: grafana-datasource.yml, dest: grafana/provisioning/datasources/prometheus.yml }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: Restart monitoring stack
+
+- name: Start the monitoring stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ monitoring_dir }}"
+    state: present
+    pull: missing

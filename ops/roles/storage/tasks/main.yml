@@ -1,0 +1,38 @@
+---
+# Opt-in role. Run only via playbooks/storage.yml, in a maintenance window.
+- name: Refuse to run unless explicitly enabled
+  ansible.builtin.assert:
+    that:
+      - storage_enabled | default(false) | bool
+      - storage_vg | length > 0
+    fail_msg: Run with -e storage_enabled=true and set storage_vg / storage_lvs (see defaults).
+
+- name: Install LVM tools and rsync
+  ansible.builtin.apt:
+    name: [lvm2, rsync]
+    state: present
+
+- name: Create/extend the volume group (only if new disks are listed)
+  community.general.lvg:
+    vg: "{{ storage_vg }}"
+    pvs: "{{ storage_pvs }}"
+  when: storage_pvs | length > 0
+
+- name: Logical volumes
+  ansible.builtin.include_tasks: lv.yml
+  loop: "{{ storage_lvs | selectattr('enabled', 'defined') | selectattr('enabled') | list }}"
+  loop_control:
+    loop_var: lv
+    label: "{{ lv.mount }}"
+
+- name: Harden /dev/shm
+  ansible.posix.mount:
+    path: /dev/shm
+    src: tmpfs
+    fstype: tmpfs
+    opts: defaults,nodev,nosuid,noexec
+    state: mounted
+
+- name: Verify fstab by mounting everything
+  ansible.builtin.command: mount -a
+  changed_when: false

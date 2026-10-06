@@ -1,0 +1,7 @@
+*.retry
+inventory/local.yml
+.env
+*.pem
+id_*
+!*.pub
+artifacts/

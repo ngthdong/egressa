@@ -1,0 +1,33 @@
+---
+- name: Install auditd
+  ansible.builtin.apt:
+    name: [auditd, audispd-plugins]
+    state: present
+
+- name: Log retention in auditd.conf
+  ansible.builtin.lineinfile:
+    path: /etc/audit/auditd.conf
+    regexp: "^{{ item.key }}\\s*="
+    line: "{{ item.key }} = {{ item.value }}"
+  loop:
+    - { key: max_log_file, value: 50 }
+    - { key: num_logs, value: 10 }
+    - { key: max_log_file_action, value: ROTATE }
+    - { key: space_left_action, value: SYSLOG }
+    - { key: admin_space_left_action, value: SUSPEND }
+  notify: Restart auditd
+
+- name: Deploy audit rules
+  ansible.builtin.template:
+    src: 99-ops.rules.j2
+    dest: /etc/audit/rules.d/99-ops.rules
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Load audit rules
+
+- name: Enable and start auditd
+  ansible.builtin.service:
+    name: auditd
+    state: started
+    enabled: true

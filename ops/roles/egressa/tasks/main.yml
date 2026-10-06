@@ -1,0 +1,175 @@
+---
+- name: Required settings are present
+  ansible.builtin.assert:
+    that:
+      - egressa_controller_url | length > 0
+      - egressa_gateway_token | length >= 32
+      - egressa_component != 'controller' or egressa_client_token | length >= 32
+      - egressa_component != 'controller' or (controller_tls_cert | length > 0 and controller_tls_key | length > 0)
+      - egressa_component != 'gateway' or egressa_id | length > 0
+    fail_msg: >-
+      Set CONTROLLER_URL, EGRESSA_GATEWAY_TOKEN, EGRESSA_CLIENT_TOKEN (>= 32 chars),
+      CONTROLLER_TLS_CERT / CONTROLLER_TLS_KEY, and egressa_id for each gateway.
+  no_log: true
+
+- name: Checksum of the locally built binary
+  ansible.builtin.stat:
+    path: "{{ egressa_bin_dir }}/{{ egressa_component }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: egressa_local
+  check_mode: false
+
+- name: The binary exists and matches this server's CPU
+  ansible.builtin.assert:
+    that:
+      - egressa_local.stat.exists
+      - >
+        egressa_goarch in ['amd64', 'arm64'] and
+        ansible_architecture == {'amd64': 'x86_64', 'arm64': 'aarch64'}[egressa_goarch]
+    fail_msg: >-
+      {{ egressa_bin_dir }}/{{ egressa_component }} is missing (run scripts/build-artifacts.sh)
+      or was built for GOARCH={{ egressa_goarch }} but the server is {{ ansible_architecture }}.
+
+- name: Release id = first 12 chars of the binary's sha256 (same binary => no restart)
+  ansible.builtin.set_fact:
+    egressa_release: "{{ egressa_local.stat.checksum[:12] }}"
+
+- name: Service user (controller only)
+  ansible.builtin.user:
+    name: "{{ egressa_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+  when: egressa_component == 'controller'
+
+- name: Directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /opt/egressa, group: root, mode: "0755" }
+    - { path: /opt/egressa/releases, group: root, mode: "0755" }
+    - { path: "/opt/egressa/releases/{{ egressa_release }}", group: root, mode: "0755" }
+    - { path: /etc/egressa, group: "{{ egressa_user if egressa_component == 'controller' else 'root' }}", mode: "0750" }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Install the binary
+  ansible.builtin.copy:
+    src: "{{ egressa_bin_dir }}/{{ egressa_component }}"
+    dest: "/opt/egressa/releases/{{ egressa_release }}/{{ egressa_component }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Point "current" at this release
+  ansible.builtin.file:
+    src: "/opt/egressa/releases/{{ egressa_release }}"
+    dest: /opt/egressa/current
+    state: link
+  notify: Restart egressa service
+
+- name: Environment file with the token(s)
+  ansible.builtin.template:
+    src: "{{ egressa_component }}.env.j2"
+    dest: /etc/egressa/{{ egressa_component }}.env
+    owner: root
+    group: "{{ egressa_user if egressa_component == 'controller' else 'root' }}"
+    mode: "{{ '0640' if egressa_component == 'controller' else '0600' }}"
+  no_log: true
+  notify: Restart egressa service
+
+- name: Controller TLS and policy
+  when: egressa_component == 'controller'
+  block:
+    - name: TLS directory
+      ansible.builtin.file:
+        path: /etc/egressa/tls
+        state: directory
+        owner: root
+        group: "{{ egressa_user }}"
+        mode: "0750"
+
+    - name: TLS certificate and key
+      ansible.builtin.copy:
+        dest: "/etc/egressa/tls/{{ item.name }}"
+        content: "{{ item.value }}\n"
+        owner: root
+        group: "{{ egressa_user }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { name: cert.pem, value: "{{ controller_tls_cert }}", mode: "0440" }
+        - { name: key.pem, value: "{{ controller_tls_key }}", mode: "0440" }
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+      notify: Restart egressa service
+
+    - name: Optional policy file
+      ansible.builtin.copy:
+        src: "{{ egressa_policy_src }}"
+        dest: /etc/egressa/policy.json
+        owner: root
+        group: "{{ egressa_user }}"
+        mode: "0440"
+      when: egressa_policy_src | length > 0
+      notify: Restart egressa service
+
+- name: systemd unit
+  ansible.builtin.template:
+    src: "egressa-{{ egressa_component }}.service.j2"
+    dest: "/etc/systemd/system/egressa-{{ egressa_component }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart egressa service
+
+- name: Apply changes now (restart only if something changed)
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start
+  ansible.builtin.service:
+    name: "egressa-{{ egressa_component }}"
+    state: started
+    enabled: true
+
+- name: Controller answers on its port
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ egressa_controller_port }}"
+    timeout: 30
+  when: egressa_component == 'controller'
+
+- name: Gateway listens on its WireGuard UDP port
+  ansible.builtin.command: "ss -H -uln 'sport = :{{ egressa_wg_port }}'"
+  register: egressa_wg_listen
+  until: egressa_wg_listen.stdout | length > 0
+  retries: 10
+  delay: 3
+  changed_when: false
+  when: egressa_component == 'gateway'
+
+- name: Let the service settle, then make sure it did not crash-loop
+  ansible.builtin.wait_for:
+    timeout: 10
+
+- name: Service is active
+  ansible.builtin.command: "systemctl is-active egressa-{{ egressa_component }}"
+  changed_when: false
+
+- name: Prune old releases (keep current + {{ egressa_releases_keep }})
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      cur="$(readlink -f /opt/egressa/current)"
+      ls -1dt /opt/egressa/releases/*/ | sed 's:/$::' | grep -vx "$cur" | tail -n +$(( {{ egressa_releases_keep }} + 1 )) | xargs -r rm -rf
+  changed_when: false
+  check_mode: false

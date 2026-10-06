@@ -1,0 +1,22 @@
+---
+monitoring_dir: /opt/monitoring
+docker_monitoring_subnet: 172.28.0.0/16
+# Pin and bump to the latest stable versions before the first deploy.
+prometheus_image: prom/prometheus:v2.53.0
+alertmanager_image: prom/alertmanager:v0.27.0
+grafana_image: grafana/grafana-oss:11.1.0
+prometheus_retention: 30d
+
+# Telegram alerts: OFF for now. Alerts are still evaluated by Prometheus and visible in the
+# Prometheus/Alertmanager UI (SSH tunnel). To turn on: set true and provide TELEGRAM_* secrets.
+telegram_enabled: false
+
+# Secrets come from the environment (GitHub Secrets in CI)
+telegram_bot_token: "{{ lookup('env', 'TELEGRAM_BOT_TOKEN') }}"
+telegram_chat_id: "{{ lookup('env', 'TELEGRAM_CHAT_ID') }}"
+grafana_admin_password: "{{ lookup('env', 'GRAFANA_ADMIN_PASSWORD') }}"
+healthchecks_ping_url: "{{ lookup('env', 'HEALTHCHECKS_PING_URL') }}"   # optional dead-man's switch
+
+egressa_client_token: "{{ lookup('env', 'EGRESSA_CLIENT_TOKEN') }}"
+controller_tls_cert: "{{ lookup('env', 'CONTROLLER_TLS_CERT') }}"
+controller_tls_key: "{{ lookup('env', 'CONTROLLER_TLS_KEY') }}"

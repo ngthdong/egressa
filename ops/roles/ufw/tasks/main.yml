@@ -1,0 +1,98 @@
+---
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+# Allow rules FIRST, then default-deny, then enable => never a window without SSH.
+- name: Allow SSH
+  community.general.ufw:
+    rule: allow
+    port: "{{ ssh_port }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+    comment: ssh
+  loop: "{{ ufw_ssh_cidrs if (ufw_ssh_cidrs | length > 0) else ['any'] }}"
+
+- name: Allow VPN ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port | string }}"
+    proto: "{{ item.proto }}"
+    comment: vpn
+  loop: "{{ vpn_ports }}"
+
+- name: Allow node_exporter from the controller (gateways)
+  community.general.ufw:
+    rule: allow
+    port: "{{ node_exporter_port | string }}"
+    proto: tcp
+    from_ip: "{{ controller_ip }}"
+    comment: prometheus-scrape
+  when: "'gateways' in group_names"
+
+- name: Allow node_exporter from the Prometheus container network (controller)
+  community.general.ufw:
+    rule: allow
+    port: "{{ node_exporter_port | string }}"
+    proto: tcp
+    from_ip: "{{ docker_monitoring_subnet }}"
+    comment: prometheus-scrape
+  when: "'controller' in group_names"
+
+- name: Egressa backbone - random UDP ports, only from the other gateways
+  community.general.ufw:
+    rule: allow
+    proto: udp
+    from_ip: "{{ hostvars[item].ansible_host }}"
+    comment: egressa-backbone
+  loop: "{{ groups['gateways'] | difference([inventory_hostname]) }}"
+  when: "'gateways' in group_names and egressa_enabled | bool"
+
+- name: Egressa controller API (TLS + token; clients connect from anywhere)
+  community.general.ufw:
+    rule: allow
+    port: "{{ egressa_controller_port | string }}"
+    proto: tcp
+    comment: egressa-controller
+  when: "'controller' in group_names and egressa_enabled | bool"
+
+- name: Allow traffic arriving on tunnel interfaces
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: "{{ item }}"
+    comment: egressa-tunnel
+  loop: "{{ ufw_allow_in_interfaces }}"
+
+- name: Extra rules
+  community.general.ufw:
+    rule: "{{ item.rule | default('allow') }}"
+    port: "{{ item.port | string }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    from_ip: "{{ item.from_ip | default('any') }}"
+    comment: "{{ item.comment | default('extra') }}"
+  loop: "{{ ufw_extra_rules }}"
+
+- name: Default deny incoming
+  community.general.ufw:
+    default: deny
+    direction: incoming
+
+- name: Default allow outgoing
+  community.general.ufw:
+    default: allow
+    direction: outgoing
+
+- name: Default routed policy
+  community.general.ufw:
+    default: "{{ ufw_default_routed }}"
+    direction: routed
+
+- name: Logging
+  community.general.ufw:
+    logging: "low"
+
+- name: Enable ufw
+  community.general.ufw:
+    state: enabled

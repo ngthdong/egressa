@@ -1,0 +1,26 @@
+# Managed by Ansible (ops/roles/egressa)
+[Unit]
+Description=Egressa gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The gateway needs root (TUN, routes, ip rules, iptables). It removes what it added on exit,
+# so stop it with SIGTERM and give it time to clean up.
+EnvironmentFile=/etc/egressa/gateway.env
+ExecStart=/opt/egressa/current/gateway --id {{ egressa_id }} --controller {{ egressa_controller_url }} --role {{ egressa_roles }} --endpoint {{ ansible_host }}:{{ egressa_wg_port }} --uplink {{ egressa_uplink }}
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+StateDirectory=egressa
+# Conservative hardening; relax if the gateway needs more.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

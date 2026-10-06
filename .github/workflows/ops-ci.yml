@@ -1,0 +1,60 @@
+name: ops-ci
+on:
+  pull_request:
+    paths: ["ops/**", ".github/workflows/ops-*.yml"]
+  push:
+    branches-ignore: [main]
+    paths: ["ops/**", ".github/workflows/ops-*.yml"]
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ops
+    env:
+      # dummy values so inventory lookups resolve during syntax-check
+      CONTROLLER_IP: 192.0.2.10
+      GATEWAY1_IP: 192.0.2.11
+      GATEWAY2_IP: 192.0.2.12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install tooling
+        run: pip install "ansible-core>=2.16,<2.18" ansible-lint yamllint
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+      - name: yamllint
+        run: yamllint -c .yamllint .
+      - name: ansible-lint
+        run: ansible-lint
+      - name: Syntax check
+        run: |
+          ansible-playbook playbooks/site.yml --syntax-check
+          ansible-playbook playbooks/verify.yml --syntax-check
+          ansible-playbook playbooks/storage.yml --syntax-check
+      - name: shellcheck
+        run: shellcheck scripts/*.sh roles/node_exporter/files/ops-metrics.sh
+      - name: Build deployment artifacts
+        run: |
+          EGRESSA_GOARCH=amd64 bash scripts/build-artifacts.sh
+          file artifacts/controller artifacts/gateway
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/roles/monitoring_stack/files:/rules:ro" \
+            --entrypoint promtool prom/prometheus:v2.53.0 check rules /rules/alerts.yml
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

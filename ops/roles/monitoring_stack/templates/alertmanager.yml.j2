@@ -1,0 +1,41 @@
+# Managed by Ansible (ops/roles/monitoring_stack)
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: telegram
+  group_by: [alertname, instance]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Always-firing Watchdog => heartbeat (dead-man's switch), never to Telegram
+    - matchers: ['alertname = "Watchdog"']
+      receiver: heartbeat
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 5m
+    - matchers: ['severity = "critical"']
+      receiver: telegram
+      repeat_interval: 1h
+
+receivers:
+  - name: notify
+{% if telegram_enabled | bool %}
+    telegram_configs:
+      - bot_token_file: /etc/alertmanager/secrets/telegram_token
+        chat_id: {{ telegram_chat_id | int }}
+        send_resolved: true
+{% endif %}
+
+  - name: heartbeat
+{% if healthchecks_ping_url | length > 0 %}
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/heartbeat_url
+        send_resolved: false
+{% endif %}
+
+inhibit_rules:
+  - source_matchers: ['severity = "critical"']
+    target_matchers: ['severity = "warning"']
+    equal: [instance]

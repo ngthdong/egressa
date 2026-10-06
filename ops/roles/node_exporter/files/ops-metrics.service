@@ -1,0 +1,6 @@
+[Unit]
+Description=Export ops metrics for node_exporter textfile collector
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ops-metrics

@@ -1,0 +1,45 @@
+---
+# ---------- Accounts / SSH ----------
+admin_user: isQHung
+deploy_user: deploy            # used by CI/CD (GitHub Actions); created by the playbook
+ssh_port: 22
+ssh_allow_users: ["{{ admin_user }}", "{{ deploy_user }}"]
+
+# PUBLIC keys only (safe to commit). Replace the placeholders BEFORE the first run:
+# the ssh role refuses to run (to avoid locking you out) while a REPLACE placeholder remains.
+ssh_authorized_keys:
+  isQHung:
+    - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCuBCQltErTPBe1wSpTJ1ZFaS2uRYG4ZI9wvwq1ns69wMdOfswzu1eATwBbsMOl/1IcJTxQpE+DXvmln7vdkhl24ZSjy0nDYxqHhLi0m+zsNukawNycblD2l3/Lb1kBMYH9QkdA4sKNPvuUObnPOt3D84JDa++IxKriv9o/OeOj1yajhLo9X0aDGqp4mByp5bLBMuRV6fLxSijCtUzaJI3KpQTR9NY+oxbde3vN1V+sK1FXAbKeFNFrKpRWCRyFb1vB47VR706SIx5y+CtgOEHUF5koc9NFytMISEQaQqRJIh50rSTKXOSyz7mzqOismGLrmKhMM4/5BSWZq7XrUuZLvOthrw6DKzSAOwBQ1ncJ4Q7ZwwlZQdtgs5z9qM9TCKYNfKDAkENVYdiRs7ayK1il16T1M5sbnXhuGKnG2fYpD3M3EaCYV7yk4LAICGLBWRQvJOHpXNVuKtsZ1+GpweRl6opkSulDhfJjSJS3FR/ULkIayCanpKgvaxe8Ke/mNmaWmB/gHrGHtalbC/oTKkF2uz481Z9n5ZU1NVkLiNg65/QKVjI+QBIgZtEpTOKcprWeyNbZqVz7jDKGCSb/UVJDy9B9o9lrHP2zfm+tv9GwqF7ODfraUspJF1kh14BeSqiMptKCI9ESdPybNCLdeSHQCaNwlDiPARwHHU7mBXjZhQ== isqhung@isQ"
+  deploy:
+    - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGFhv6/BWD8520z8xd29cuwd0kOJy3fu1/dHNWoDaa5x github-actions-deploy"
+
+# ---------- Firewall ----------
+ufw_ssh_cidrs: []              # [] = SSH from anywhere (key-only + fail2ban). Fill in to restrict.
+ufw_default_routed: deny       # gateways: choose after the VPN protocol is decided
+vpn_ports: []                  # e.g. [{ port: 51820, proto: udp }]
+ufw_extra_rules: []            # e.g. [{ port: 8443, proto: tcp, from_ip: 1.2.3.4, comment: api }]
+ufw_allow_in_interfaces: []    # tunnel interfaces whose traffic may reach the host itself (see README, section 6)
+
+# ---------- fail2ban ----------
+fail2ban_ignoreip: ["127.0.0.1/8", "::1"]   # add your fixed IPs here
+fail2ban_maxretry: 4
+fail2ban_findtime: 10m
+fail2ban_bantime: 1h
+
+# ---------- auditd ----------
+audit_immutable: false         # true => "-e 2": rules locked until reboot (Ansible can't change them)
+audit_extra_watch_paths: ["/etc/egressa", "/opt/egressa"]
+
+# ---------- Monitoring ----------
+node_exporter_port: 9100
+controller_ip: "{{ hostvars[groups['controller'][0]].ansible_host }}"
+timezone: UTC
+
+# ---------- Egressa application ----------
+egressa_enabled: true
+egressa_wg_port: 51820                 # client WireGuard UDP port on every gateway
+egressa_controller_port: 8080
+egressa_goarch: "{{ lookup('env', 'EGRESSA_GOARCH') | default('amd64', true) }}"
+egressa_bin_dir: "{{ lookup('env', 'EGRESSA_BIN_DIR') | default(playbook_dir ~ '/../artifacts', true) }}"
+egressa_controller_url: "{{ lookup('env', 'CONTROLLER_URL') }}"          # e.g. https://ctl.example.com:8080
+egressa_gateway_token: "{{ lookup('env', 'EGRESSA_GATEWAY_TOKEN') }}"

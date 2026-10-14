@@ -1,0 +1,15 @@
+{
+  "name": "b",
+  "description": "The backbone trap: the direct path to gw1 gets 40 ms worse each way (80 ms RTT) while the backbone gw2 <-> gw1 gets 100 ms worse each way (200 ms RTT), for 90 s.",
+  "expect": "With egress gw1, the client stays on the direct path: the detour reaches gw2 fast but pays the slow backbone end to end. No migration.",
+  "steps": [
+    {"at": "10s", "node": "client", "peer": "gw1", "delay": "40ms"},
+    {"at": "10s", "node": "gw1", "peer": "client", "delay": "40ms"},
+    {"at": "10s", "node": "gw2", "peer": "gw1", "delay": "100ms"},
+    {"at": "10s", "node": "gw1", "peer": "gw2", "delay": "100ms"},
+    {"at": "100s", "node": "client", "peer": "gw1", "clear": true},
+    {"at": "100s", "node": "gw1", "peer": "client", "clear": true},
+    {"at": "100s", "node": "gw2", "peer": "gw1", "clear": true},
+    {"at": "100s", "node": "gw1", "peer": "gw2", "clear": true}
+  ]
+}

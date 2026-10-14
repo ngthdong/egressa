@@ -1,0 +1,11 @@
+{
+  "name": "c",
+  "description": "The direct path from the client to gw1 dies (100% loss both ways) for 60 s, then comes back.",
+  "expect": "With egress gw1, the client cuts over to gw2 about 3 s after the path dies, without waiting for the flap guard, keeping egress gw1; it can move back after the path returns and the minimum residence passes.",
+  "steps": [
+    {"at": "10s", "node": "client", "peer": "gw1", "loss": 100},
+    {"at": "10s", "node": "gw1", "peer": "client", "loss": 100},
+    {"at": "70s", "node": "client", "peer": "gw1", "clear": true},
+    {"at": "70s", "node": "gw1", "peer": "client", "clear": true}
+  ]
+}

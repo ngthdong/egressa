@@ -52,9 +52,12 @@ type Config struct {
 	Egress string
 	// FullTunnel routes all of the host's traffic through the VPN.
 	FullTunnel bool
-	MTU        int
-	DeadAfter  time.Duration
-	Probe      pathmon.Config
+	// Bypass are hosts kept off the VPN in full tunnel mode, besides the
+	// controller and the gateways: an operator's SSH or Prometheus host.
+	Bypass    []netip.Addr
+	MTU       int
+	DeadAfter time.Duration
+	Probe     pathmon.Config
 	// Logger receives the agent's logs; nil means slog.Default().
 	Logger *slog.Logger
 	// Metrics, if set, receives the agent's metrics.
@@ -234,6 +237,9 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.addBypass(h)
 			}
 		}
+		for _, h := range a.cfg.Bypass {
+			a.addBypass(h)
+		}
 	}
 
 	probe, err := pathmon.ListenUDP(netip.AddrPortFrom(a.session.VirtualIP, 0))
@@ -265,6 +271,7 @@ func (a *Agent) runIPsec(ctx, runCtx context.Context, cancel context.CancelFunc,
 	} else if addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", a.cfg.Controller.Host()); err == nil {
 		controllers = append(controllers, addrs...)
 	}
+	controllers = append(controllers, a.cfg.Bypass...)
 	var split []netip.Prefix
 	if !a.cfg.FullTunnel {
 		split = []netip.Prefix{a.network.NodeSubnet}

@@ -5,9 +5,11 @@ package main
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -96,7 +98,8 @@ func TestConf(t *testing.T) {
 	if _, err := readConf(path); !errors.Is(err, errNotJoined) {
 		t.Fatalf("missing conf: %v", err)
 	}
-	want := conf{Controller: "https://ctl", Token: "s3cr3t", Egress: "sg"}
+	want := conf{Controller: "https://ctl", Token: "s3cr3t", Egress: "sg", LogFormat: "json",
+		Bypass: []netip.Addr{netip.MustParseAddr("198.51.100.7")}}
 	if err := writeConf(path, want); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +108,7 @@ func TestConf(t *testing.T) {
 		t.Fatalf("conf mode %v, %v; it holds the token", fi.Mode(), err)
 	}
 	got, err := readConf(path)
-	if err != nil || got != want {
+	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("read %+v, %v", got, err)
 	}
 	if err := os.WriteFile(path, []byte(`{"controller":"https://ctl"}`), 0o600); err != nil {
@@ -204,3 +207,15 @@ func TestUnitFile(t *testing.T) {
 }
 
 func b64(s string) string { return base64RawURL(s) }
+
+func TestFlagGiven(t *testing.T) {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.String("log-format", "text", "")
+	fs.String("log-level", "info", "")
+	if err := fs.Parse([]string{"--log-level", "debug"}); err != nil {
+		t.Fatal(err)
+	}
+	if flagGiven(fs, "log-format") || !flagGiven(fs, "log-level") {
+		t.Error("flagGiven")
+	}
+}

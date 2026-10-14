@@ -538,6 +538,13 @@ func printStatus(w io.Writer, st client.Status) {
 	_ = tw.Flush()
 }
 
+// flagGiven says whether name was set on the command line.
+func flagGiven(fs *flag.FlagSet, name string) bool {
+	given := false
+	fs.Visit(func(f *flag.Flag) { given = given || f.Name == name })
+	return given
+}
+
 func cmdRun(args []string) error {
 	var logs cliutil.LogFlags
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
@@ -548,11 +555,14 @@ func cmdRun(args []string) error {
 	if err := ensureRoot(); err != nil {
 		return err
 	}
-	logger, err := logs.Logger("client", "")
+	c, err := readConf(confPath())
 	if err != nil {
 		return err
 	}
-	c, err := readConf(confPath())
+	if c.LogFormat != "" && !flagGiven(fs, "log-format") {
+		logs.Format = c.LogFormat
+	}
+	logger, err := logs.Logger("client", "")
 	if err != nil {
 		return err
 	}
@@ -581,7 +591,7 @@ func cmdRun(args []string) error {
 	}
 	agent, err := client.New(client.Config{
 		Controller: ctl, StateFile: statePath(), StatusFile: statusPath(),
-		Interface: "egressa0", Egress: c.Egress, FullTunnel: true,
+		Interface: "egressa0", Egress: c.Egress, FullTunnel: true, Bypass: c.Bypass,
 		Logger: logger, Metrics: telemetry.NewClientMetrics(reg), Tracer: telemetry.NewTracer(logger, nil),
 		Backend: c.Backend, IPsec: ipsecCfg,
 	})

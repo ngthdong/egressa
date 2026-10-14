@@ -14,7 +14,7 @@ import shlex
 import sys
 
 ROLES = {"controller": "controller", "gateways": "gateway", "clients": "client"}
-DEFAULT_PORT = "9101"  # deploy/ansible/group_vars/all.yml
+DEFAULT_PORT = "9101"  # deploy/ansible/roles/egressa/defaults/main.yml
 
 
 def parse(lines):

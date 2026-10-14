@@ -4,22 +4,22 @@
   hosts: all
   become: true
   gather_facts: true
-  roles: [preflight]
+  roles: [egressa, preflight]
 
 - name: TLS for the controller's API
   hosts: controller
   gather_facts: false
-  roles: [tls]
+  roles: [egressa, tls]
 
 - name: Base and firewall
   hosts: all
   become: true
-  roles: [common, firewall]
+  roles: [egressa, common, firewall]
 
 - name: Controller
   hosts: controller
   become: true
-  roles: [controller]
+  roles: [egressa, controller]
 
 # One at a time: a gateway that restarts drops the sessions it carries,
 # and the role waits for it to be healthy, its backbones up, before the
@@ -28,10 +28,10 @@
   hosts: gateways
   become: true
   serial: 1
-  roles: [gateway]
+  roles: [egressa, gateway]
 
 - name: Clients
   hosts: clients
   become: true
   serial: 1
-  roles: [client]
+  roles: [egressa, client]

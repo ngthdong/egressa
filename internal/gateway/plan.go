@@ -70,6 +70,19 @@ type Plan struct {
 	EgressSessions int
 	// Sessions holds every session's path, by session ID.
 	Sessions map[string]SessionPath
+	// IPsec holds, on an access gateway, every IPsec session by ID: each
+	// gets its own IKE connection, keyed and limited to its virtual IP.
+	IPsec map[string]IPsecClient
+	// IPsecHere holds the virtual IPs of the IPsec sessions whose access
+	// this gateway is now: their return traffic goes into the IPsec
+	// interface.
+	IPsecHere map[netip.Addr]bool
+}
+
+// IPsecClient is one IPsec session as an access gateway serves it.
+type IPsecClient struct {
+	VirtualIP netip.Addr
+	PSK       string
 }
 
 // SessionPath is where a session is, as of its epoch.
@@ -89,6 +102,8 @@ func MakePlan(me string, roles api.Roles, st api.GatewayState) Plan {
 		Return:    make(map[netip.Addr]string),
 		Epochs:    make(map[string]uint64),
 		Sessions:  make(map[string]SessionPath),
+		IPsec:     make(map[string]IPsecClient),
+		IPsecHere: make(map[netip.Addr]bool),
 	}
 	known := make(map[string]bool, len(st.Gateways))
 	for _, g := range st.Gateways {
@@ -116,7 +131,14 @@ func MakePlan(me string, roles api.Roles, st api.GatewayState) Plan {
 			p.EgressSessions++
 		}
 		if isAccess {
-			p.Peers[s.PublicKey] = s.VirtualIP
+			if s.Backend == api.BackendIPsec {
+				p.IPsec[s.ID] = IPsecClient{VirtualIP: s.VirtualIP, PSK: s.IPsecPSK}
+				if s.Access == me {
+					p.IPsecHere[s.VirtualIP] = true
+				}
+			} else {
+				p.Peers[s.PublicKey] = s.VirtualIP
+			}
 			if s.Egress != me && known[s.Egress] {
 				p.Forward[s.VirtualIP] = s.Egress
 			}

@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -59,6 +60,9 @@ type Config struct {
 	Metrics *telemetry.ControllerMetrics
 	// Tracer, if set, logs a span for each migration request.
 	Tracer *telemetry.Tracer
+	// IPsecKey is the master key IPsec sessions' pre-shared keys are
+	// derived from; with none, sessions can only use WireGuard.
+	IPsecKey []byte
 }
 
 type clientRecord struct {
@@ -66,6 +70,7 @@ type clientRecord struct {
 	PublicKey  string     `json:"public_key"`
 	VirtualIP  netip.Addr `json:"virtual_ip"`
 	SecretHash string     `json:"secret_hash"`
+	Backend    string     `json:"backend,omitempty"`
 }
 
 type linkEntry struct {
@@ -319,8 +324,6 @@ func parsePublicKey(s string) error {
 	return nil
 }
 
-// --- store access ---
-
 func (s *Server) gateways(ctx context.Context) ([]api.Gateway, error) {
 	raw, err := s.cfg.Store.List(ctx, gatewayKeyPrefix)
 	if err != nil {
@@ -383,10 +386,38 @@ func (s *Server) session(ctx context.Context, c clientRecord) (api.Session, erro
 	if !found {
 		return api.Session{}, fmt.Errorf("controller: session %s has no ownership record", c.ID)
 	}
-	return api.Session{
+	sess := api.Session{
 		ID: c.ID, PublicKey: c.PublicKey, VirtualIP: c.VirtualIP,
 		Access: own.Access, Egress: own.Egress, Epoch: own.Epoch,
-	}, nil
+		Backend: api.BackendWireGuard,
+	}
+	if c.Backend == api.BackendIPsec {
+		sess.Backend = api.BackendIPsec
+		sess.IPsecPSK = s.ipsecPSK(c.ID)
+	}
+	return sess, nil
+}
+
+// ipsecPSK derives session id's IKE pre-shared key from the master key:
+// one key per session, so one client's key never authenticates another
+// client's identity or virtual IP. Nothing derived is stored.
+func (s *Server) ipsecPSK(id string) string {
+	m := hmac.New(sha256.New, s.cfg.IPsecKey)
+	m.Write([]byte("egressa/ipsec-psk/v1\x00" + id))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+func normBackend(b string) string {
+	if b == "" {
+		return api.BackendWireGuard
+	}
+	return b
+}
+
+// canAccess reports whether gateway g can be the access of a session with
+// backend.
+func canAccess(g api.Gateway, backend string) bool {
+	return g.Roles.Has(control.RoleAccess) && (backend != api.BackendIPsec || g.IPsec)
 }
 
 // allocate returns the lowest address in p, from its third, that used
@@ -447,7 +478,7 @@ func (s *Server) registerGateway(w http.ResponseWriter, r *http.Request) {
 	}
 	next := api.Gateway{
 		ID: id, Roles: req.Roles, Endpoint: req.Endpoint, PublicKey: req.PublicKey,
-		NodeIP: g.NodeIP, BackbonePorts: req.BackbonePorts,
+		NodeIP: g.NodeIP, BackbonePorts: req.BackbonePorts, IPsec: req.IPsec,
 	}
 	if !existed || !gatewayEqual(g, next) {
 		if err := s.put(ctx, gatewayKeyPrefix+id, next); err != nil {
@@ -586,8 +617,9 @@ func randomSessionID() (string, error) {
 }
 
 // pickPath chooses a new session's first path: egress as asked (or the
-// first live egress), and that same gateway as access when it can be one.
-func pickPath(gws []api.Gateway, alive map[string]bool, egress string) (access, eg string, err error) {
+// first live egress), and that same gateway as access when it can be one
+// for backend.
+func pickPath(gws []api.Gateway, alive map[string]bool, egress, backend string) (access, eg string, err error) {
 	usable := func(g api.Gateway, role control.GatewayRole) bool { return g.Roles.Has(role) && alive[g.ID] }
 	if egress != "" {
 		g, ok := api.FindGateway(gws, egress)
@@ -606,13 +638,16 @@ func pickPath(gws []api.Gateway, alive map[string]bool, egress string) (access, 
 	if eg == "" {
 		return "", "", errors.New("no live egress gateway")
 	}
-	if g, _ := api.FindGateway(gws, eg); g.Roles.Has(control.RoleAccess) {
+	if g, _ := api.FindGateway(gws, eg); canAccess(g, backend) {
 		return eg, eg, nil
 	}
 	for _, g := range gws {
-		if usable(g, control.RoleAccess) {
+		if usable(g, control.RoleAccess) && canAccess(g, backend) {
 			return g.ID, eg, nil
 		}
+	}
+	if backend == api.BackendIPsec {
+		return "", "", errors.New("no live access gateway accepts IPsec clients")
 	}
 	return "", "", errors.New("no live access gateway")
 }
@@ -628,6 +663,15 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := parsePublicKey(req.PublicKey); err != nil {
 		writeErr(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	if !api.ValidBackend(req.Backend) {
+		writeErr(w, http.StatusBadRequest, "unknown backend %q", req.Backend)
+		return
+	}
+	backend := normBackend(req.Backend)
+	if backend == api.BackendIPsec && len(s.cfg.IPsecKey) == 0 {
+		writeErr(w, http.StatusBadRequest, "this controller has no IPsec key; only WireGuard is available")
 		return
 	}
 	ctx := r.Context()
@@ -646,6 +690,13 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusConflict, "this public key already has a session; send its secret to reopen it")
 			return
 		}
+		if normBackend(cs[i].Backend) != backend {
+			if err := s.switchBackendLocked(ctx, cs[i], backend); err != nil {
+				writeErr(w, http.StatusServiceUnavailable, "%v", err)
+				return
+			}
+			cs[i].Backend = backend
+		}
 		sess, err := s.session(ctx, cs[i])
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "%v", err)
@@ -660,7 +711,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	access, egress, err := pickPath(gws, s.alive, req.Egress)
+	access, egress, err := pickPath(gws, s.alive, req.Egress, backend)
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, "%v", err)
 		return
@@ -689,15 +740,50 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	rec := clientRecord{ID: id, PublicKey: req.PublicKey, VirtualIP: vip, SecretHash: hashSecret(secret)}
+	rec := clientRecord{ID: id, PublicKey: req.PublicKey, VirtualIP: vip, SecretHash: hashSecret(secret), Backend: backend}
 	if err := s.put(ctx, clientKeyPrefix+id, rec); err != nil {
 		writeErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	s.bumpLocked()
 	s.log.InfoContext(telemetry.WithSession(ctx, id), "session opened", "virtual_ip", vip.String(), "access", access, "egress", egress)
-	sess := api.Session{ID: id, PublicKey: req.PublicKey, VirtualIP: vip, Access: access, Egress: egress, Epoch: 1}
+	sess, err := s.session(ctx, rec)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, api.CreateSessionResponse{Session: sess, Secret: secret, Network: s.cfg.Network})
+}
+
+// switchBackendLocked records that session c's client now uses backend.
+// A session switching to IPsec whose access gateway does not accept IPsec
+// clients is moved to one that does, keeping its egress, at a new epoch.
+func (s *Server) switchBackendLocked(ctx context.Context, c clientRecord, backend string) error {
+	cur, err := s.session(ctx, c)
+	if err != nil {
+		return err
+	}
+	gws, err := s.gateways(ctx)
+	if err != nil {
+		return err
+	}
+	if g, _ := api.FindGateway(gws, cur.Access); !canAccess(g, backend) {
+		access, _, err := pickPath(gws, s.alive, cur.Egress, backend)
+		if err != nil {
+			return err
+		}
+		next := control.OwnershipRecord{Session: c.ID, Access: access, Egress: cur.Egress, Epoch: cur.Epoch + 1}
+		if _, err := s.ownership.SetIfNewer(ctx, next); err != nil {
+			return err
+		}
+	}
+	c.Backend = backend
+	if err := s.put(ctx, clientKeyPrefix+c.ID, c); err != nil {
+		return err
+	}
+	s.bumpLocked()
+	s.log.InfoContext(telemetry.WithSession(ctx, c.ID), "session backend changed", "backend", backend)
+	return nil
 }
 
 func (s *Server) clientState(w http.ResponseWriter, r *http.Request, c clientRecord) {
@@ -761,8 +847,8 @@ func (s *Server) migrate(w http.ResponseWriter, r *http.Request, c clientRecord)
 		fail(telemetry.MigrationError, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	if g, ok := api.FindGateway(gws, req.Access); !ok || !g.Roles.Has(control.RoleAccess) {
-		fail(telemetry.MigrationRejected, http.StatusBadRequest, "no access gateway %q", req.Access)
+	if g, ok := api.FindGateway(gws, req.Access); !ok || !canAccess(g, normBackend(c.Backend)) {
+		fail(telemetry.MigrationRejected, http.StatusBadRequest, "no access gateway %q for a %s session", req.Access, normBackend(c.Backend))
 		return
 	}
 	if g, ok := api.FindGateway(gws, req.Egress); !ok || !g.Roles.Has(control.RoleEgress) {

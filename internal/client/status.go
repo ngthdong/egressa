@@ -24,13 +24,13 @@ type Status struct {
 	Access       string       `json:"access"`
 	Egress       string       `json:"egress"`
 	EgressIP     string       `json:"egress_ip,omitempty"`
+	Backend      string       `json:"backend,omitempty"`
 	Epoch        uint64       `json:"epoch"`
 	CurrentDead  bool         `json:"current_dead"`
 	ControllerUp bool         `json:"controller_up"`
 	Paths        []StatusPath `json:"paths"`
 }
 
-// StatusPath is one path the client scored.
 type StatusPath struct {
 	Access    string  `json:"access"`
 	Egress    string  `json:"egress"`
@@ -40,7 +40,6 @@ type StatusPath struct {
 	Active    bool    `json:"active"`
 }
 
-// ReadStatus reads a status file.
 func ReadStatus(path string) (Status, error) {
 	var st Status
 	data, err := os.ReadFile(path)
@@ -77,12 +76,17 @@ func writeStatus(path string, st Status) error {
 	return os.Rename(tmp, path)
 }
 
-// statusOf builds the status of one decision pass.
 func statusOf(sess api.Session, gws []api.Gateway, paths []Path, dead, ctlUp bool, dec Decision) Status {
 	st := Status{
-		PID: os.Getpid(), SessionID: sess.ID, VirtualIP: sess.VirtualIP.String(),
-		Access: sess.Access, Egress: sess.Egress, Epoch: sess.Epoch,
-		CurrentDead: dead, ControllerUp: ctlUp,
+		PID:          os.Getpid(),
+		SessionID:    sess.ID,
+		VirtualIP:    sess.VirtualIP.String(),
+		Access:       sess.Access,
+		Egress:       sess.Egress,
+		Epoch:        sess.Epoch,
+		Backend:      sess.Backend,
+		CurrentDead:  dead,
+		ControllerUp: ctlUp,
 	}
 	if g, ok := api.FindGateway(gws, sess.Egress); ok {
 		if host, err := g.Host(); err == nil {

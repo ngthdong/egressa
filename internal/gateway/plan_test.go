@@ -159,3 +159,32 @@ func TestMakePlan_CountsSessionsByRole(t *testing.T) {
 		}
 	}
 }
+
+func TestMakePlan_IPsecSessions(t *testing.T) {
+	st := testState()
+	vip4 := netip.MustParseAddr("10.201.0.9")
+	st.Sessions = append(st.Sessions,
+		api.Session{ID: "9", PublicKey: "c9", VirtualIP: vip4, Access: "hk", Egress: "sg", Epoch: 2, Backend: api.BackendIPsec, IPsecPSK: "k9"},
+		api.Session{ID: "10", PublicKey: "c10", VirtualIP: netip.MustParseAddr("10.201.0.10"), Access: "sg", Egress: "hk", Backend: api.BackendIPsec, IPsecPSK: "k10"},
+	)
+	p := MakePlan("hk", both, st)
+	if len(p.IPsec) != 2 || p.IPsec["9"] != (IPsecClient{VirtualIP: vip4, PSK: "k9"}) {
+		t.Errorf("IPsec clients %+v", p.IPsec)
+	}
+	if !p.IPsecHere[vip4] || len(p.IPsecHere) != 1 {
+		t.Errorf("IPsec here %v, want only session 9's virtual IP", p.IPsecHere)
+	}
+	if _, ok := p.Peers["c9"]; ok {
+		t.Error("an IPsec session got a WireGuard peer")
+	}
+	if p.Forward[vip4] != "sg" {
+		t.Error("an IPsec session leaving elsewhere is not forwarded over the backbone")
+	}
+	// Session 10 enters at sg and leaves at hk: hk returns it over the backbone.
+	if p.Return[netip.MustParseAddr("10.201.0.10")] != "sg" {
+		t.Errorf("return %v", p.Return)
+	}
+	if eu := MakePlan("eu", control.RoleEgress, st); len(eu.IPsec) != 0 {
+		t.Error("an egress-only gateway got IPsec clients")
+	}
+}

@@ -34,6 +34,9 @@ type conf struct {
 	Controller string `json:"controller"`
 	Token      string `json:"token"`
 	Egress     string `json:"egress,omitempty"`
+	// Backend is the data plane `egressa connect` last asked for:
+	// "wireguard" (or empty) or "ipsec" (--ipsec).
+	Backend string `json:"backend,omitempty"`
 	// MetricsListen, if set, is where `egressa run` serves /metrics.
 	MetricsListen string `json:"metrics_listen,omitempty"`
 }

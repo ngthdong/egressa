@@ -1,0 +1,6 @@
+---
+- name: Restart controller
+  ansible.builtin.systemd_service:
+    name: egressa-controller
+    state: restarted
+    daemon_reload: true

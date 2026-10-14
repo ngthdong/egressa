@@ -1,0 +1,63 @@
+---
+# A client host connects at once, with full tunnel. The hosts that must
+# stay reachable around the VPN (this SSH session's source and the
+# Prometheus host) are kept off it with bypass routes.
+
+- name: Work out the client's settings
+  ansible.builtin.set_fact:
+    client_exit: "{{ exit | default(hostvars[groups['gateways'][0]].gateway_id) }}"
+    client_bypass: "{{ (([ansible_env.SSH_CLIENT.split()[0]] if ansible_env.SSH_CLIENT is defined else []) + [prometheus_source]) | unique }}"
+
+- name: Set up strongSwan
+  ansible.builtin.include_role:
+    name: ipsec
+  when: egressa_backend == 'ipsec'
+
+- name: Trust the controller's private CA (Go reads the system store)
+  ansible.builtin.copy:
+    src: "{{ egressa_secrets_dir }}/tls/ca.crt"
+    dest: /usr/local/share/ca-certificates/egressa-ca.crt
+    owner: root
+    group: root
+    mode: "0644"
+  when: egressa_tls_private_ca | bool
+  register: client_ca
+  notify: Update CA certificates
+
+- name: Update the store before the client talks to the controller
+  ansible.builtin.meta: flush_handlers
+
+- name: Install egressa
+  ansible.builtin.copy:
+    src: "{{ egressa_dist_dir }}/linux-{{ egressa_arch }}/egressa"
+    dest: /usr/local/bin/egressa
+    owner: root
+    group: root
+    mode: "0755"
+  register: client_bin
+
+- name: Write the client's settings (what `egressa join` and `connect` write)
+  ansible.builtin.template:
+    src: client.conf.j2
+    dest: /etc/egressa/client.conf
+    owner: root
+    group: root
+    mode: "0600"
+  register: client_conf
+
+- name: Restart the client on new settings, a new binary or a new CA
+  ansible.builtin.command: /usr/local/bin/egressa disconnect
+  when: client_conf.changed or client_bin.changed or client_ca.changed
+  register: client_disconnect
+  changed_when: client_disconnect.rc == 0
+  failed_when: false
+
+- name: Connect
+  ansible.builtin.command: >-
+    /usr/local/bin/egressa connect -{{ client_exit }}{{ ' --ipsec' if egressa_backend == 'ipsec' else '' }}
+  register: client_connect
+  changed_when: "'Connecting' in client_connect.stdout or 'Moving' in client_connect.stdout or 'Switching' in client_connect.stdout"
+
+- name: Show the connection
+  ansible.builtin.debug:
+    msg: "{{ client_connect.stdout_lines }}"

@@ -8,5 +8,13 @@ coverage.*
 .DS_Store
 .vscode/
 .idea/  
-# The local testbed's run state, logs and generated secrets
+# Testbeds: run state, generated secrets, real inventories, Terraform state
 deploy/local/.run/
+deploy/ansible/.secrets/
+deploy/ansible/inventory.ini
+deploy/ansible/*.retry
+deploy/terraform/**/.terraform/
+deploy/terraform/**/*.tfstate
+deploy/terraform/**/*.tfstate.*
+deploy/terraform/**/terraform.tfvars
+deploy/terraform/**/inventory.ini

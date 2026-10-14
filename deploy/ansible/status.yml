@@ -1,0 +1,24 @@
+---
+# Shows the testbed's state: make testbed-status.
+- name: Services
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Ask each process for /healthz
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ egressa_metrics_port }}/healthz"
+        return_content: true
+      register: egressa_health
+      failed_when: false
+
+    - name: Client status
+      ansible.builtin.command: /usr/local/bin/egressa status
+      register: egressa_status
+      changed_when: false
+      failed_when: false
+      when: inventory_hostname in groups['clients']
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ ['healthz: ' ~ (egressa_health.content | default(egressa_health.msg) | trim)] + (egressa_status.stdout_lines | default([])) }}"

@@ -1,0 +1,35 @@
+# Managed by Ansible (deploy/ansible/roles/controller).
+[Unit]
+Description=egressa controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/egressa-controller \
+  --listen 0.0.0.0:{{ egressa_controller_port }} \
+  --state-file /var/lib/egressa/controller.json \
+  --gateway-token-file /etc/egressa/gateway.token \
+  --client-token-file /etc/egressa/client.token \
+  --client-subnet {{ egressa_client_subnet }} \
+  --node-subnet {{ egressa_node_subnet }} \
+  --probe-port {{ egressa_probe_port }} \
+{% if egressa_backend == 'ipsec' %}
+  --ipsec-key-file /etc/egressa/ipsec.key \
+{% endif %}
+{% if egressa_tls | bool %}
+  --tls-cert /etc/egressa/controller.crt \
+  --tls-key /etc/egressa/controller.key \
+{% endif %}
+  --policy /etc/egressa/policy.json \
+  --log-format json \
+  --metrics-listen 0.0.0.0:{{ egressa_metrics_port }}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/egressa
+
+[Install]
+WantedBy=multi-user.target

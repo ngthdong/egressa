@@ -1,0 +1,119 @@
+---
+- name: Forward IPv4 (client traffic crosses this host)
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_file: /etc/sysctl.d/90-egressa.conf
+    sysctl_set: true
+    state: present
+
+- name: Set up strongSwan
+  ansible.builtin.include_role:
+    name: ipsec
+  when: egressa_backend == 'ipsec'
+
+- name: Trust the controller's private CA (Go reads the system store)
+  ansible.builtin.copy:
+    src: "{{ egressa_secrets_dir }}/tls/ca.crt"
+    dest: /usr/local/share/ca-certificates/egressa-ca.crt
+    owner: root
+    group: root
+    mode: "0644"
+  when: egressa_tls_private_ca | bool
+  notify: [Update CA certificates, Restart gateway]
+
+- name: Install the gateway
+  ansible.builtin.copy:
+    src: "{{ egressa_dist_dir }}/linux-{{ egressa_arch }}/gateway"
+    dest: /usr/local/bin/egressa-gateway
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart gateway
+
+- name: Install the gateway token
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.password', egressa_secrets_dir ~ '/gateway.token chars=hexdigits length=64') }}\n"
+    dest: /etc/egressa/gateway.token
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart gateway
+
+- name: Install the unit
+  ansible.builtin.template:
+    src: egressa-gateway.service.j2
+    dest: /etc/systemd/system/egressa-gateway.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart gateway
+
+# Before starting it: a new CA must be in the store when the gateway
+# first talks to the controller.
+- name: Apply a changed CA, binary, token or unit now
+  ansible.builtin.meta: flush_handlers
+
+- name: Start the gateway
+  ansible.builtin.systemd_service:
+    name: egressa-gateway
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for the gateway to serve its metrics
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ egressa_metrics_port }}/healthz"
+  register: gateway_health
+  until: gateway_health.status == 200
+  retries: 15
+  delay: 2
+
+# Healthy means: it has applied the controller's state, and its backbone
+# to every gateway deployed before it in this run (earlier in the
+# inventory) has completed a handshake and carries probes (loss below 1).
+# A handshake alone is not enough: a gateway left on a node IP the
+# controller no longer gives it still handshakes, but loses every probe.
+# Not every backbone the state lists: a gateway registered once and gone
+# since (say, under another ID) stays in the controller's state and never
+# comes up.
+- name: Work out which backbones must come up
+  ansible.builtin.set_fact:
+    gateway_wait_peers: >-
+      {{ groups['gateways'][:groups['gateways'].index(inventory_hostname)]
+         | map('extract', hostvars, 'gateway_id') | list }}
+
+- name: Wait for those backbones to come up and carry probes
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ egressa_metrics_port }}/metrics"
+    return_content: true
+  register: gateway_metrics
+  until: >-
+    gateway_metrics.status == 200
+    and gateway_metrics.content is search('(?m)^egressa_gateway_state_version [1-9]')
+    and gateway_wait_peers
+        | difference(gateway_metrics.content
+                     | regex_findall('(?m)^egressa_gateway_backbone_up[{]peer="([^"]+)"[}] 1$'))
+        | length == 0
+    and gateway_wait_peers
+        | difference(gateway_metrics.content
+                     | regex_findall('(?m)^egressa_gateway_backbone_loss_ratio[{]peer="([^"]+)"[}] (?:0|0[.][0-9]+|[0-9.]+e-[0-9]+)$'))
+        | length == 0
+  retries: 30
+  delay: 2
+
+# The current run of the service only: a warning from before a restart
+# is history.
+- name: Fail on a gateway whose node IP is stale
+  ansible.builtin.shell: >-
+    set -o pipefail &&
+    journalctl --no-pager -o cat
+    _SYSTEMD_INVOCATION_ID="$(systemctl show -p InvocationID --value egressa-gateway)"
+  args:
+    executable: /bin/bash
+  register: gateway_journal
+  changed_when: false
+  failed_when: >-
+    gateway_journal.rc != 0
+    or 'the controller gives another node IP' in gateway_journal.stdout

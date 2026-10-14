@@ -1,0 +1,85 @@
+---
+# Fails early, saying what to do, when a host cannot run its part.
+
+- name: Check the inventory gives what the roles need
+  ansible.builtin.assert:
+    that:
+      - prometheus_source is defined
+      - prometheus_source | string | length > 0
+      - egressa_backend in ['wireguard', 'ipsec']
+      - groups['controller'] | length == 1
+      - inventory_hostname not in groups['gateways'] or gateway_id is defined
+      - (egressa_tls_cert_file | length > 0) == (egressa_tls_key_file | length > 0)
+    fail_msg: >-
+      Set prometheus_source (the Prometheus host's IP) in [all:vars], exactly
+      one [controller], gateway_id= on every gateway, and egressa_backend to
+      wireguard or ipsec, and egressa_tls_cert_file with
+      egressa_tls_key_file or neither. See inventory.example.ini.
+    quiet: true
+
+- name: Check the OS
+  ansible.builtin.assert:
+    that:
+      - ansible_system == 'Linux'
+      - ansible_service_mgr == 'systemd'
+      - ansible_architecture in ['x86_64', 'aarch64']
+    fail_msg: "egressa's roles need Linux with systemd on x86_64 or aarch64, not {{ ansible_system }}/{{ ansible_service_mgr }}/{{ ansible_architecture }}"
+    quiet: true
+
+- name: Check the prebuilt binaries exist
+  ansible.builtin.stat:
+    path: "{{ egressa_dist_dir }}/linux-{{ egressa_arch }}/{{ item }}"
+  delegate_to: localhost
+  become: false
+  loop: [controller, gateway, egressa, vpnctl]
+  register: preflight_bins
+
+- name: Fail without the binaries
+  ansible.builtin.assert:
+    that: preflight_bins.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: "Build them first: make cross (writes {{ egressa_dist_dir }}/linux-{{ egressa_arch }}/)"
+    quiet: true
+
+- name: Probe the kernel modules (netem shapes the scenarios; TUN carries WireGuard)
+  ansible.builtin.command: modprobe -n -v {{ item }}
+  loop: "{{ ['sch_netem', 'tun'] + (['xfrm_interface', 'esp4'] if egressa_backend == 'ipsec' and inventory_hostname not in groups['controller'] else []) }}"
+  register: preflight_modules
+  changed_when: false
+  failed_when: false
+
+- name: Fail on a missing kernel module
+  ansible.builtin.fail:
+    msg: >-
+      The kernel cannot load {{ item.item }}.
+      {{ 'Install it: apt install linux-modules-extra-' ~ ansible_kernel ~ ' (then reboot if the running kernel differs)'
+         if item.item in ['sch_netem', 'xfrm_interface'] else
+         'This kernel lacks ' ~ item.item ~ '; use a stock distribution kernel' }}
+      {{ ', or set egressa_backend=wireguard' if item.item in ['xfrm_interface', 'esp4'] else '' }}.
+  loop: "{{ preflight_modules.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc != 0
+
+- name: Probe the kernel WireGuard module
+  ansible.builtin.command: modprobe -n -v wireguard
+  register: preflight_wg_module
+  changed_when: false
+  failed_when: false
+
+- name: Note that the kernel WireGuard module is not required
+  ansible.builtin.debug:
+    msg: "No kernel wireguard module: fine, egressa runs WireGuard in userspace (wireguard-go) over TUN."
+  when: preflight_wg_module.rc != 0
+
+- name: Check IP forwarding can be turned on (gateways forward client traffic)
+  ansible.builtin.stat:
+    path: /proc/sys/net/ipv4/ip_forward
+  register: preflight_ip_forward
+  when: inventory_hostname in groups['gateways']
+
+- name: Fail without IP forwarding
+  ansible.builtin.assert:
+    that: preflight_ip_forward.stat.exists and preflight_ip_forward.stat.writeable
+    fail_msg: "net.ipv4.ip_forward is not writable here (a container?): a gateway needs a VM or bare metal."
+    quiet: true
+  when: inventory_hostname in groups['gateways']

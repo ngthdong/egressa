@@ -142,13 +142,23 @@ func TestServeMetrics_Errors(t *testing.T) {
 	if _, err := ServeMetrics(context.Background(), "256.0.0.1:bad", NewRegistry("x", "v", "c"), nil); err == nil {
 		t.Error("listened on a bad address")
 	}
-	// Only /metrics is served, and the server stops with its context.
+	// Only /metrics and /healthz are served, and the server stops with
+	// its context.
 	ctx, cancel := context.WithCancel(context.Background())
 	addr, err := ServeMetrics(ctx, "127.0.0.1:0", NewRegistry("x", "v", "c"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Get("http://" + addr.String() + "/v1/sessions")
+	resp, err := http.Get("http://" + addr.String() + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "ok\n" {
+		t.Errorf("/healthz: %d %q", resp.StatusCode, body)
+	}
+	resp, err = http.Get("http://" + addr.String() + "/v1/sessions")
 	if err != nil {
 		t.Fatal(err)
 	}

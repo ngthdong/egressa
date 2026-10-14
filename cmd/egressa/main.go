@@ -34,13 +34,17 @@ import (
 	"github.com/ngthdong/egressa/internal/client"
 	"github.com/ngthdong/egressa/internal/cliutil"
 	"github.com/ngthdong/egressa/internal/control"
+	"github.com/ngthdong/egressa/internal/ipsec"
 	"github.com/ngthdong/egressa/internal/telemetry"
 )
 
 const usage = `egressa: VPN client
 
   sudo egressa join <invite>     join the VPN (once), with the invite from your admin
-  egressa connect [-<gateway>]   connect; -<gateway> picks where you leave to the Internet (e.g. -sg)
+  egressa connect [-<gateway>] [--ipsec]
+                                 connect; -<gateway> picks where you leave to the Internet (e.g. -sg);
+                                 --ipsec encrypts the hop to the first gateway with IPsec instead of
+                                 WireGuard (needs strongSwan's charon running)
   egressa status                 show the connection
   egressa disconnect             disconnect
   egressa list                   list the gateways
@@ -114,20 +118,34 @@ func ensureRoot() error {
 	return syscall.Exec(sudo, argv, os.Environ())
 }
 
-// parseGateway reads connect's argument: "-sg", "--sg" and "sg" all name
-// gateway sg; no argument keeps the egress the client has.
-func parseGateway(args []string) (string, error) {
-	switch len(args) {
-	case 0:
-		return "", nil
-	case 1:
-		id := strings.TrimLeft(args[0], "-")
-		if id == "" {
-			return "", fmt.Errorf("bad gateway %q", args[0])
+// parseConnect reads connect's arguments.
+func parseConnect(args []string) (gateway string, useIPsec bool, err error) {
+	for _, a := range args {
+		if a == "--ipsec" || a == "-ipsec" {
+			useIPsec = true
+			continue
 		}
-		return id, nil
+		id := strings.TrimLeft(a, "-")
+		switch {
+		case id == "":
+			return "", false, fmt.Errorf("bad gateway %q", a)
+		case gateway != "":
+			return "", false, fmt.Errorf("connect takes one gateway, got %q and %q", gateway, id)
+		}
+		gateway = id
 	}
-	return "", fmt.Errorf("connect takes one gateway, got %q", strings.Join(args, " "))
+	return gateway, useIPsec, nil
+}
+
+// charonReady checks the IPsec backend can run: charon is up with its
+// vici socket.
+func charonReady() error {
+	path := envOr("EGRESSA_VICI_SOCKET", ipsec.DefaultViciSocket)
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("--ipsec needs strongSwan's charon running with the vici plugin, and %s is missing.\n"+
+			"  Ubuntu/Debian: sudo apt install charon-systemd strongswan-swanctl && sudo systemctl enable --now strongswan", path)
+	}
+	return nil
 }
 
 func controllerClient(c conf) (*api.Client, error) { return api.NewClient(c.Controller, c.Token) }
@@ -186,7 +204,7 @@ func egressIDs(gws []api.Gateway) []string {
 
 func printGateways(w io.Writer, gws []api.Gateway) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	pf(tw, "GATEWAY\tLEAVE FROM HERE\tSTATUS\tIP\n")
+	pf(tw, "GATEWAY\tLEAVE FROM HERE\tSTATUS\tIPSEC\tIP\n")
 	for _, g := range gws {
 		exit := "no"
 		if g.Roles.Has(control.RoleEgress) {
@@ -196,8 +214,12 @@ func printGateways(w io.Writer, gws []api.Gateway) {
 		if !g.Alive {
 			state = "DOWN"
 		}
+		ipsecOK := "-"
+		if g.IPsec {
+			ipsecOK = "yes"
+		}
 		host, _ := g.Host()
-		pf(tw, "%s\t%s\t%s\t%s\n", g.ID, exit, state, host)
+		pf(tw, "%s\t%s\t%s\t%s\t%s\n", g.ID, exit, state, ipsecOK, host)
 	}
 	_ = tw.Flush()
 }
@@ -281,9 +303,16 @@ func running() (client.Status, bool) {
 }
 
 func cmdConnect(args []string) error {
-	want, err := parseGateway(args)
+	want, useIPsec, err := parseConnect(args)
 	if err != nil {
 		return err
+	}
+	backend := api.BackendWireGuard
+	if useIPsec {
+		backend = api.BackendIPsec
+		if err := charonReady(); err != nil {
+			return err
+		}
 	}
 	if err := ensureRoot(); err != nil {
 		return err
@@ -308,12 +337,25 @@ func cmdConnect(args []string) error {
 		}
 		// New sessions start there; a running one is moved below.
 		c.Egress = want
-		if err := writeConf(confPath(), c); err != nil {
-			return err
-		}
+	}
+	if backend == api.BackendIPsec && !slices.ContainsFunc(gws, func(g api.Gateway) bool { return g.IPsec && g.Alive }) {
+		return errors.New("no gateway accepts IPsec clients right now; connect without --ipsec")
+	}
+	c.Backend = backend
+	if err := writeConf(confPath(), c); err != nil {
+		return err
 	}
 
 	st, up := running()
+	if up && backendOf(st) != backend {
+		// Another data plane: restart the client on the new one. The
+		// session (and virtual IP) stays; the controller switches it.
+		fmt.Printf("Switching from %s to %s...\n", backendOf(st), backend)
+		if err := stopAndWait(); err != nil {
+			return err
+		}
+		up = false
+	}
 	if !up {
 		exe, err := os.Executable()
 		if err != nil {
@@ -395,6 +437,28 @@ func switchEgress(ctl *api.Client, gws []api.Gateway, egress string) error {
 	return errors.New("the session kept moving; try again")
 }
 
+func backendOf(st client.Status) string {
+	if st.Backend == "" {
+		return api.BackendWireGuard
+	}
+	return st.Backend
+}
+
+// stopAndWait stops the background client and waits for it to exit.
+func stopAndWait() error {
+	if err := pickService().Stop(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, up := running(); !up {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return errors.New("the client is still running")
+}
+
 func cmdDisconnect() error {
 	if err := ensureRoot(); err != nil {
 		return err
@@ -403,18 +467,11 @@ func cmdDisconnect() error {
 		fmt.Println("Not connected.")
 		return nil
 	}
-	if err := pickService().Stop(); err != nil {
+	if err := stopAndWait(); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, up := running(); !up {
-			fmt.Println("Disconnected.")
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return errors.New("the client is still running")
+	fmt.Println("Disconnected.")
+	return nil
 }
 
 func cmdStatus(w io.Writer) error {
@@ -445,6 +502,11 @@ func printStatus(w io.Writer, st client.Status) {
 	}
 	pf(tw, "  Leaving from:\t%s\n", exit)
 	pf(tw, "  Entering at:\t%s\n", st.Access)
+	enc := "WireGuard"
+	if backendOf(st) == api.BackendIPsec {
+		enc = "IPsec to the entry gateway, WireGuard between gateways"
+	}
+	pf(tw, "  Encryption:\t%s\n", enc)
 	pf(tw, "  Virtual IP:\t%s\n", st.VirtualIP)
 	pf(tw, "  Path changes:\t%d\n", st.Epoch-1)
 	_ = tw.Flush()
@@ -476,6 +538,13 @@ func printStatus(w io.Writer, st client.Status) {
 	_ = tw.Flush()
 }
 
+// flagGiven says whether name was set on the command line.
+func flagGiven(fs *flag.FlagSet, name string) bool {
+	given := false
+	fs.Visit(func(f *flag.Flag) { given = given || f.Name == name })
+	return given
+}
+
 func cmdRun(args []string) error {
 	var logs cliutil.LogFlags
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
@@ -486,11 +555,14 @@ func cmdRun(args []string) error {
 	if err := ensureRoot(); err != nil {
 		return err
 	}
-	logger, err := logs.Logger("client", "")
+	c, err := readConf(confPath())
 	if err != nil {
 		return err
 	}
-	c, err := readConf(confPath())
+	if c.LogFormat != "" && !flagGiven(fs, "log-format") {
+		logs.Format = c.LogFormat
+	}
+	logger, err := logs.Logger("client", "")
 	if err != nil {
 		return err
 	}
@@ -504,10 +576,24 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	var ipsecCfg *client.IPsecConfig
+	if c.Backend == api.BackendIPsec {
+		ike, err := ipsec.NewViciIKE(ctx, ipsec.WithViciSocket(envOr("EGRESSA_VICI_SOCKET", ipsec.DefaultViciSocket)))
+		if err != nil {
+			return fmt.Errorf("connect to charon: %w", err)
+		}
+		defer func() { _ = ike.Close() }()
+		n, err := ipsec.NewNetlinkNet()
+		if err != nil {
+			return err
+		}
+		ipsecCfg = &client.IPsecConfig{IKE: ike, Net: n}
+	}
 	agent, err := client.New(client.Config{
 		Controller: ctl, StateFile: statePath(), StatusFile: statusPath(),
-		Interface: "egressa0", Egress: c.Egress, FullTunnel: true,
+		Interface: "egressa0", Egress: c.Egress, FullTunnel: true, Bypass: c.Bypass,
 		Logger: logger, Metrics: telemetry.NewClientMetrics(reg), Tracer: telemetry.NewTracer(logger, nil),
+		Backend: c.Backend, IPsec: ipsecCfg,
 	})
 	if err != nil {
 		return err

@@ -1,0 +1,91 @@
+---
+# ufw, opening exactly what each role needs. SSH is allowed before ufw is
+# turned on, so this never locks Ansible out.
+#
+# Not opened here: the probe port (UDP 51900 on the gateway's node IP).
+# Probes arrive through the tunnel interfaces (egc0, egb<n>, egi0), and
+# the gateway inserts an INPUT rule for exactly that itself, removing it
+# when it stops. deploy/local/testbed.sh FIREWALL=1 mirrors these rules
+# for the regression test; change both together.
+
+- name: Allow SSH
+  community.general.ufw:
+    rule: allow
+    port: "{{ egressa_ssh_port | string }}"
+    proto: tcp
+
+- name: Let only the Prometheus host reach the metrics port
+  community.general.ufw:
+    rule: allow
+    port: "{{ egressa_metrics_port | string }}"
+    proto: tcp
+    from_ip: "{{ prometheus_source }}"
+    comment: egressa metrics
+
+# prometheus_source changes (a home connection's IP is often dynamic):
+# the opening for the old address goes, since that address may now be
+# someone else's.
+- name: Find metrics-port openings for other Prometheus hosts
+  ansible.builtin.shell: >-
+    set -o pipefail &&
+    ufw status | awk '$1 == "{{ egressa_metrics_port }}/tcp" && $2 == "ALLOW" && /# egressa metrics/ {print $3}'
+  args:
+    executable: /bin/bash
+  register: firewall_metrics_sources
+  changed_when: false
+
+- name: Close them
+  community.general.ufw:
+    rule: allow
+    port: "{{ egressa_metrics_port | string }}"
+    proto: tcp
+    from_ip: "{{ item }}"
+    delete: true
+  loop: "{{ firewall_metrics_sources.stdout_lines | difference([prometheus_source]) }}"
+
+- name: Controller API (gateways and clients)
+  community.general.ufw:
+    rule: allow
+    port: "{{ egressa_controller_port | string }}"
+    proto: tcp
+    comment: egressa controller
+  when: inventory_hostname in groups['controller']
+
+- name: Client WireGuard
+  community.general.ufw:
+    rule: allow
+    port: "{{ egressa_wireguard_port | string }}"
+    proto: udp
+    comment: egressa clients
+  when: inventory_hostname in groups['gateways']
+
+- name: Backbone from the other gateways (WireGuard on ports picked at start)
+  community.general.ufw:
+    rule: allow
+    proto: udp
+    from_ip: "{{ hostvars[item].ansible_host | default(item) }}"
+    comment: egressa backbone
+  loop: "{{ groups['gateways'] | difference([inventory_hostname]) }}"
+  when: inventory_hostname in groups['gateways']
+
+- name: IKE and ESP-in-UDP from IPsec clients
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: udp
+    comment: egressa ipsec
+  loop: ["500", "4500"]
+  when: inventory_hostname in groups['gateways'] and egressa_backend == 'ipsec'
+
+- name: ESP from IPsec clients (without NAT, ESP is not wrapped in UDP)
+  community.general.ufw:
+    rule: allow
+    proto: esp
+    comment: egressa ipsec
+  when: inventory_hostname in groups['gateways'] and egressa_backend == 'ipsec'
+
+- name: Deny everything else inbound and turn ufw on
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming

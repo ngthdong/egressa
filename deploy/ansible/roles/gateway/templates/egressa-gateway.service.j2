@@ -1,0 +1,29 @@
+# Managed by Ansible (deploy/ansible/roles/gateway).
+[Unit]
+Description=egressa gateway {{ gateway_id }}
+After=network-online.target{{ ' strongswan.service' if egressa_backend == 'ipsec' else '' }}
+Wants=network-online.target
+{% if egressa_backend == 'ipsec' %}
+Requires=strongswan.service
+{% endif %}
+
+[Service]
+ExecStart=/usr/local/bin/egressa-gateway \
+  --id {{ gateway_id }} \
+  --controller {{ egressa_controller_url }} \
+  --token-file /etc/egressa/gateway.token \
+  --role {{ gateway_roles | default('access,egress') }} \
+  --listen-port {{ egressa_wireguard_port }} \
+  --endpoint {{ ansible_host | default(inventory_hostname) }}:{{ egressa_wireguard_port }} \
+  --uplink {{ ansible_default_ipv4.interface }} \
+  --private-key-file /var/lib/egressa/gateway.key \
+{% if egressa_backend == 'ipsec' %}
+  --ipsec \
+{% endif %}
+  --log-format json \
+  --metrics-listen 0.0.0.0:{{ egressa_metrics_port }}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

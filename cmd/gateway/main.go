@@ -21,6 +21,7 @@ import (
 	"github.com/ngthdong/egressa/internal/buildinfo"
 	"github.com/ngthdong/egressa/internal/cliutil"
 	"github.com/ngthdong/egressa/internal/gateway"
+	"github.com/ngthdong/egressa/internal/ipsec"
 	"github.com/ngthdong/egressa/internal/telemetry"
 	"github.com/ngthdong/egressa/internal/tunnel"
 )
@@ -39,6 +40,8 @@ func main() {
 		keyFile     = flag.String("private-key-file", "/var/lib/egressa/gateway.key", "this gateway's private key (base64), created if missing")
 		mtu         = flag.Int("mtu", gateway.DefaultMTU, "tunnel MTU")
 		metrics     = flag.String("metrics-listen", "", cliutil.MetricsFlagHelp)
+		useIPsec    = flag.Bool("ipsec", false, "also accept IPsec clients, through charon (strongSwan) over vici; the backbone stays WireGuard")
+		viciSocket  = flag.String("vici-socket", ipsec.DefaultViciSocket, "charon's vici socket (with --ipsec)")
 	)
 	logs.Register(flag.CommandLine)
 	flag.Parse()
@@ -84,10 +87,24 @@ func main() {
 	if err != nil {
 		cliutil.Fatal(logger, "start the metrics server", err)
 	}
+	var ipsecCfg *gateway.IPsecConfig
+	if *useIPsec {
+		ike, err := ipsec.NewViciIKE(ctx, ipsec.WithViciSocket(*viciSocket))
+		if err != nil {
+			cliutil.Fatal(logger, "connect to charon (is strongSwan's charon running with the vici plugin?)", err)
+		}
+		defer func() { _ = ike.Close() }()
+		n, err := ipsec.NewNetlinkNet()
+		if err != nil {
+			cliutil.Fatal(logger, "netlink", err)
+		}
+		ipsecCfg = &gateway.IPsecConfig{IKE: ike, Net: n}
+	}
 	agent, err := gateway.New(gateway.Config{
 		ID: *id, Controller: ctl, Roles: roles, Key: key,
 		ListenPort: uint16(*listenPort), Endpoint: *endpoint, Uplink: *uplink, MTU: *mtu,
 		Logger: logger, Metrics: telemetry.NewGatewayMetrics(reg), Tracer: telemetry.NewTracer(logger, nil),
+		IPsec: ipsecCfg,
 	})
 	if err != nil {
 		cliutil.Fatal(logger, "bad configuration", err)

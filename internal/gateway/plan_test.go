@@ -113,6 +113,10 @@ func TestWithOp(t *testing.T) {
 	if r[2] != "%s" {
 		t.Error("withOp changed its input")
 	}
+	probe := withOp(probeInputRule("egb+", netip.MustParseAddr("10.200.0.1"), 51900), "-I")
+	if want := []string{"-I", "INPUT", "-i", "egb+", "-p", "udp", "-d", "10.200.0.1/32", "--dport", "51900", "-j", "ACCEPT"}; !reflect.DeepEqual(probe, want) {
+		t.Errorf("probeInputRule %v", probe)
+	}
 	if got := ruleFrom(vip1, 1003); !reflect.DeepEqual(got, []string{"from", "10.201.0.2/32", "lookup", "1003", "pref", "1000"}) {
 		t.Errorf("ruleFrom %v", got)
 	}
@@ -157,5 +161,34 @@ func TestMakePlan_CountsSessionsByRole(t *testing.T) {
 		if p.AccessSessions != tc.access || p.EgressSessions != tc.egress {
 			t.Errorf("%s (%s): access %d, egress %d; want %d, %d", tc.me, tc.roles, p.AccessSessions, p.EgressSessions, tc.access, tc.egress)
 		}
+	}
+}
+
+func TestMakePlan_IPsecSessions(t *testing.T) {
+	st := testState()
+	vip4 := netip.MustParseAddr("10.201.0.9")
+	st.Sessions = append(st.Sessions,
+		api.Session{ID: "9", PublicKey: "c9", VirtualIP: vip4, Access: "hk", Egress: "sg", Epoch: 2, Backend: api.BackendIPsec, IPsecPSK: "k9"},
+		api.Session{ID: "10", PublicKey: "c10", VirtualIP: netip.MustParseAddr("10.201.0.10"), Access: "sg", Egress: "hk", Backend: api.BackendIPsec, IPsecPSK: "k10"},
+	)
+	p := MakePlan("hk", both, st)
+	if len(p.IPsec) != 2 || p.IPsec["9"] != (IPsecClient{VirtualIP: vip4, PSK: "k9"}) {
+		t.Errorf("IPsec clients %+v", p.IPsec)
+	}
+	if !p.IPsecHere[vip4] || len(p.IPsecHere) != 1 {
+		t.Errorf("IPsec here %v, want only session 9's virtual IP", p.IPsecHere)
+	}
+	if _, ok := p.Peers["c9"]; ok {
+		t.Error("an IPsec session got a WireGuard peer")
+	}
+	if p.Forward[vip4] != "sg" {
+		t.Error("an IPsec session leaving elsewhere is not forwarded over the backbone")
+	}
+	// Session 10 enters at sg and leaves at hk: hk returns it over the backbone.
+	if p.Return[netip.MustParseAddr("10.201.0.10")] != "sg" {
+		t.Errorf("return %v", p.Return)
+	}
+	if eu := MakePlan("eu", control.RoleEgress, st); len(eu.IPsec) != 0 {
+		t.Error("an egress-only gateway got IPsec clients")
 	}
 }

@@ -1,0 +1,56 @@
+---
+# Defaults for every host; override in inventory.ini or with -e.
+
+# Data plane from clients to their entry (access) gateway: wireguard or
+# ipsec. Between gateways it is always WireGuard.
+egressa_backend: wireguard
+
+# GOARCH of the host, from its facts.
+egressa_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(ansible_architecture, ansible_architecture) }}"
+
+# Prebuilt binaries, from `make cross` (dist/linux-<arch>/).
+egressa_dist_dir: "{{ playbook_dir }}/../../dist"
+
+# Generated secrets (tokens, IPsec master key) stay on the machine running
+# Ansible, in this git-ignored directory, and are copied to the hosts
+# that need them as root-only files.
+egressa_secrets_dir: "{{ playbook_dir }}/.secrets"
+
+egressa_controller_port: 8080
+egressa_wireguard_port: 51820
+# Not 9100: that is node_exporter's port, which runs on the same hosts.
+# (The local testbed keeps 9100: it runs in namespaces of its own.)
+egressa_metrics_port: 9101
+egressa_ssh_port: 22
+
+# The overlay, set explicitly rather than left to the controller's
+# defaults: client virtual IPs, gateway node IPs, and the UDP port each
+# gateway answers probes on (over the tunnels only; the gateway opens it
+# there itself).
+egressa_client_subnet: 10.201.0.0/16
+egressa_node_subnet: 10.200.0.0/24
+egressa_probe_port: 51900
+
+# HTTPS for the controller's API: the gateway and client tokens and the
+# gateways' keys cross it. By default a private CA and a certificate for
+# egressa_controller_address are generated in .secrets/tls/ on the machine
+# running Ansible, and gateways and clients add that CA to their system
+# trust store. false serves plain HTTP (tokens in the clear).
+egressa_tls: true
+# Your own certificate and key instead (e.g. from Let's Encrypt): paths on
+# the machine running Ansible. No CA is generated then; set
+# egressa_controller_address to the name the certificate is for.
+egressa_tls_cert_file: ""
+egressa_tls_key_file: ""
+egressa_tls_private_ca: "{{ (egressa_tls | bool) and not egressa_tls_cert_file }}"
+
+# Where gateways and clients reach the controller.
+egressa_controller_address: "{{ hostvars[groups['controller'][0]].ansible_host | default(groups['controller'][0]) }}"
+egressa_controller_url: "{{ 'https' if egressa_tls | bool else 'http' }}://{{ egressa_controller_address }}:{{ egressa_controller_port }}"
+
+# Short flap-guard timers so a scenario shows its migrations within its
+# run time. Durations are in nanoseconds, costs in microseconds.
+egressa_policy:
+  version: 1
+  decision: {Z: 1.645, MigrationCost: 5000, SafetyMargin: 5000}
+  flap_guard: {ConfirmationWindow: 2000000000, MinResidence: 10000000000, Cooldown: 5000000000}

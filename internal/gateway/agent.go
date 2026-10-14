@@ -56,6 +56,8 @@ type Config struct {
 	Metrics *telemetry.GatewayMetrics
 	// Tracer, if set, logs a span each time a session's move is applied.
 	Tracer *telemetry.Tracer
+	// IPsec, if set, lets clients connect over IPsec besides WireGuard.
+	IPsec *IPsecConfig
 }
 
 type backbone struct {
@@ -98,6 +100,10 @@ type Agent struct {
 	// applied is each session's path as last applied, to tell which
 	// sessions a plan moves.
 	applied map[string]SessionPath
+	// ipsecConns are the IPsec sessions loaded into charon; ipsecHere the
+	// virtual IPs whose return route points into the IPsec interface.
+	ipsecConns map[string]IPsecClient
+	ipsecHere  map[netip.Addr]bool
 
 	stateVersion atomic.Uint64
 	controllerUp atomic.Bool
@@ -124,16 +130,18 @@ func New(cfg Config) (*Agent, error) {
 		cfg.Logger = slog.Default()
 	}
 	a := &Agent{
-		cfg:       cfg,
-		log:       cfg.Logger,
-		gate:      control.NewEpochGate(),
-		index:     make(map[string]int),
-		backbones: make(map[string]*backbone),
-		peers:     make(map[string]netip.Addr),
-		forward:   make(map[netip.Addr]string),
-		ret:       make(map[netip.Addr]string),
-		fenced:    make(map[string]uint64),
-		applied:   make(map[string]SessionPath),
+		cfg:        cfg,
+		log:        cfg.Logger,
+		gate:       control.NewEpochGate(),
+		index:      make(map[string]int),
+		backbones:  make(map[string]*backbone),
+		peers:      make(map[string]netip.Addr),
+		forward:    make(map[netip.Addr]string),
+		ret:        make(map[netip.Addr]string),
+		fenced:     make(map[string]uint64),
+		applied:    make(map[string]SessionPath),
+		ipsecConns: make(map[string]IPsecClient),
+		ipsecHere:  make(map[netip.Addr]bool),
 	}
 	a.fence.Store(&map[uint64]uint64{})
 	return a, nil
@@ -207,6 +215,7 @@ func (a *Agent) register(ctx context.Context) (api.RegisterGatewayResponse, erro
 		Endpoint:      a.cfg.Endpoint,
 		PublicKey:     tunnel.Base64(a.cfg.Key.Public),
 		BackbonePorts: ports,
+		IPsec:         a.cfg.IPsec != nil && a.cfg.Roles.Has(control.RoleAccess),
 	})
 	if err != nil {
 		return resp, err
@@ -379,6 +388,26 @@ func (a *Agent) setup() error {
 		a.undo = append(a.undo, func() { _ = deleteIptables(r) })
 	}
 
+	if a.cfg.IPsec != nil && a.cfg.Roles.Has(control.RoleAccess) {
+		if err := a.setupIPsec(); err != nil {
+			return err
+		}
+	}
+
+	// Probes come in through the tunnels: from clients over egc0 (or
+	// egi0 for IPsec clients), from other gateways over egb<n>.
+	probeDevs := []string{clientDevice, "egb+"}
+	if a.cfg.IPsec != nil && a.cfg.Roles.Has(control.RoleAccess) {
+		probeDevs = append(probeDevs, ipsecDevice)
+	}
+	for _, dev := range probeDevs {
+		r := probeInputRule(dev, a.nodeIP, a.network.ProbePort)
+		if err := ensureIptables(r); err != nil {
+			return err
+		}
+		a.undo = append(a.undo, func() { _ = deleteIptables(r) })
+	}
+
 	echo, err := pathmon.ListenUDP(netip.AddrPortFrom(a.nodeIP, a.network.ProbePort))
 	if err != nil {
 		return err
@@ -402,6 +431,9 @@ func (a *Agent) teardown() {
 	}
 	for _, n := range a.index {
 		_ = flushTable(egressTableBase + n)
+	}
+	if a.cfg.IPsec != nil {
+		a.teardownIPsec()
 	}
 	a.mu.Unlock()
 	clearRules(fwdRulePref)
@@ -520,6 +552,17 @@ func (a *Agent) apply(p Plan) error {
 		a.forward[vip] = egress
 	}
 
+	ipsecOn := a.cfg.IPsec != nil && a.cfg.Roles.Has(control.RoleAccess)
+	ictx, icancel := context.WithTimeout(context.Background(), ipsecOpWait)
+	defer icancel()
+	if ipsecOn {
+		for _, err := range a.removeIPsecLocked(ictx, p) {
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+
 	for vip, access := range a.ret {
 		if p.Return[vip] == access {
 			continue
@@ -545,6 +588,13 @@ func (a *Agent) apply(p Plan) error {
 		}
 		a.log.Info("return route changed", "virtual_ip", vip.String(), "access", access)
 		a.ret[vip] = access
+	}
+	if ipsecOn {
+		for _, err := range a.addIPsecLocked(ictx, p) {
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
 	return errors.Join(errs...)
 }

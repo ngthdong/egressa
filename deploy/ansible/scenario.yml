@@ -1,0 +1,74 @@
+---
+# Runs a netem scenario on every host at once: make scenario S=a|b|c.
+#
+# Each host shapes its own outgoing traffic to the scenario's peers; all
+# start at the same Unix second (chrony keeps the clocks together), a
+# little after this play starts. Scenario nodes are named client, gw1,
+# gw2...: a gateway is its gateway_id, a client its name= (default client).
+- name: Run a netem scenario
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    scenario: "{{ S | default('') }}"
+    lead_seconds: 20
+  tasks:
+    - name: Check the scenario
+      ansible.builtin.assert:
+        that: scenario in ['a', 'b', 'c']
+        fail_msg: "Pick a scenario: make scenario S=a (or b, c); see deploy/scenarios."
+        quiet: true
+
+    - name: Push the scenario
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scenarios/{{ scenario }}.json"
+        dest: /etc/egressa/scenarios/{{ scenario }}.json
+        owner: root
+        group: root
+        mode: "0644"
+
+    # The address of each host: ansible_host when the inventory names it.
+    - name: Note this host's address
+      ansible.builtin.set_fact:
+        egressa_addr: "{{ ansible_host | default(inventory_hostname) }}"
+
+    - name: Agree on a start time and on who is who
+      ansible.builtin.set_fact:
+        egressa_start: "{{ hostvars[groups['all'][0]].ansible_date_time.epoch | int + lead_seconds }}"
+        egressa_node: >-
+          {{ gateway_id if inventory_hostname in groups['gateways']
+             else (name | default('client')) if inventory_hostname in groups['clients']
+             else 'controller' }}
+        egressa_hosts: >-
+          {{ (groups['gateways'] | map('extract', hostvars, 'gateway_id')
+                | zip(groups['gateways'] | map('extract', hostvars, 'egressa_addr'))
+              + groups['clients'] | map('extract', hostvars) | map(attribute='name', default='client')
+                | zip(groups['clients'] | map('extract', hostvars, 'egressa_addr'))
+              + [['controller', hostvars[groups['controller'][0]].egressa_addr]])
+             | map('join', '=') | join(',') }}
+
+    # Not the default route's interface: on a full-tunnel client that is
+    # the tunnel. The scenario shapes the underlay, the way to a peer.
+    - name: Find the interface traffic to the other hosts leaves by
+      ansible.builtin.shell: >-
+        set -o pipefail &&
+        ip -o route get {{ hostvars[(groups['all'] | difference([inventory_hostname]))[0]].egressa_addr }}
+        | grep -o 'dev [^ ]*' | cut -d' ' -f2
+      args:
+        executable: /bin/bash
+      register: egressa_dev
+      changed_when: false
+
+    - name: Run it (every host starts at {{ egressa_start }})
+      ansible.builtin.command: >-
+        /usr/local/bin/vpnctl netem run --scenario /etc/egressa/scenarios/{{ scenario }}.json
+        --node {{ egressa_node }} --hosts {{ egressa_hosts }}
+        --dev {{ egressa_dev.stdout }} --start {{ egressa_start }}
+      async: 1800
+      poll: 5
+      register: egressa_run
+      changed_when: true
+
+    - name: Show what each host did
+      ansible.builtin.debug:
+        msg: "{{ egressa_run.stdout_lines }}"

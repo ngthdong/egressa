@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,8 +35,16 @@ type conf struct {
 	Controller string `json:"controller"`
 	Token      string `json:"token"`
 	Egress     string `json:"egress,omitempty"`
+	// Backend is the data plane `egressa connect` last asked for:
+	// "wireguard" (or empty) or "ipsec" (--ipsec).
+	Backend string `json:"backend,omitempty"`
 	// MetricsListen, if set, is where `egressa run` serves /metrics.
 	MetricsListen string `json:"metrics_listen,omitempty"`
+	// LogFormat, if set, is `egressa run`'s log format when --log-format
+	// is not given: "json" makes its spans readable by `vpnctl trace`.
+	LogFormat string `json:"log_format,omitempty"`
+	// Bypass are hosts kept off the VPN, e.g. the operator's SSH host.
+	Bypass []netip.Addr `json:"bypass,omitempty"`
 }
 
 var errNotJoined = errors.New("this machine has not joined a VPN yet; run: sudo egressa join <invite>")

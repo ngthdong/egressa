@@ -37,6 +37,7 @@ type options struct {
 	probePort                        uint
 	tlsCert, tlsKey                  string
 	metricsListen                    string
+	ipsecKeyFile                     string
 }
 
 func main() {
@@ -57,6 +58,7 @@ func main() {
 	flag.StringVar(&o.tlsCert, "tls-cert", "", "serve HTTPS with this certificate")
 	flag.StringVar(&o.tlsKey, "tls-key", "", "and this key")
 	flag.StringVar(&o.metricsListen, "metrics-listen", "", cliutil.MetricsFlagHelp)
+	flag.StringVar(&o.ipsecKeyFile, "ipsec-key-file", "", "file holding the master key IPsec sessions' pre-shared keys are derived from (default: $EGRESSA_IPSEC_KEY; with neither, clients can only use WireGuard)")
 	logs.Register(flag.CommandLine)
 	flag.Parse()
 
@@ -96,6 +98,13 @@ func run(o options, logger *slog.Logger) error {
 	clToken, err := cliutil.Secret(o.clTokenFile, "EGRESSA_CLIENT_TOKEN")
 	if err != nil {
 		return err
+	}
+	ipsecKey, err := cliutil.Secret(o.ipsecKeyFile, "EGRESSA_IPSEC_KEY")
+	if err != nil {
+		return err
+	}
+	if ipsecKey != "" && len(ipsecKey) < 32 {
+		return errors.New("the IPsec master key must be at least 32 characters (e.g. openssl rand -hex 32)")
 	}
 	if gwToken == "" || clToken == "" {
 		logger.Warn("a gateway or client token is empty; anyone who reaches the API can use that part of it", "listen", o.listen)
@@ -144,6 +153,7 @@ func run(o options, logger *slog.Logger) error {
 		Store: store, GatewayToken: gwToken, ClientToken: clToken, Policy: policy,
 		Network: api.Network{ClientSubnet: cs, NodeSubnet: ns, ProbePort: uint16(o.probePort)},
 		Logger:  logger, Metrics: telemetry.NewControllerMetrics(reg), Tracer: telemetry.NewTracer(logger, nil),
+		IPsecKey: []byte(ipsecKey),
 	})
 	if err != nil {
 		return err
@@ -158,7 +168,8 @@ func run(o options, logger *slog.Logger) error {
 		_ = hs.Shutdown(sctx)
 	}()
 	logger.Info("starting", "build", buildinfo.String("controller"), "listen", o.listen,
-		"gateway_token", telemetry.Secret(gwToken), "client_token", telemetry.Secret(clToken))
+		"gateway_token", telemetry.Secret(gwToken), "client_token", telemetry.Secret(clToken),
+		"ipsec", ipsecKey != "", "ipsec_key", telemetry.Secret(ipsecKey))
 	if o.tlsCert != "" {
 		err = hs.ListenAndServeTLS(o.tlsCert, o.tlsKey)
 	} else {

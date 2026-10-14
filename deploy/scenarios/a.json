@@ -1,0 +1,11 @@
+{
+  "name": "a",
+  "description": "The direct path from the client to gw1 degrades by 150 ms each way (300 ms RTT) for 90 s, then recovers.",
+  "expect": "With egress gw1, the client moves its entry to gw2 (client -> gw2 -> gw1) once the flap guard allows, keeping egress gw1 and its open connections; it moves back after the path recovers.",
+  "steps": [
+    {"at": "10s", "node": "client", "peer": "gw1", "delay": "150ms", "jitter": "5ms"},
+    {"at": "10s", "node": "gw1", "peer": "client", "delay": "150ms", "jitter": "5ms"},
+    {"at": "100s", "node": "client", "peer": "gw1", "clear": true},
+    {"at": "100s", "node": "gw1", "peer": "client", "clear": true}
+  ]
+}

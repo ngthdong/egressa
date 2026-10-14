@@ -88,6 +88,8 @@ func ServeMetrics(ctx context.Context, addr string, r *Registry, logger *slog.Lo
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", r.Handler())
+	// Liveness, for testbeds and load balancers: the process is up.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()

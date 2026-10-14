@@ -1,0 +1,37 @@
+---
+# Brings the VPS testbed up: make testbed-up (after make cross).
+- name: Preflight
+  hosts: all
+  become: true
+  gather_facts: true
+  roles: [preflight]
+
+- name: TLS for the controller's API
+  hosts: controller
+  gather_facts: false
+  roles: [tls]
+
+- name: Base and firewall
+  hosts: all
+  become: true
+  roles: [common, firewall]
+
+- name: Controller
+  hosts: controller
+  become: true
+  roles: [controller]
+
+# One at a time: a gateway that restarts drops the sessions it carries,
+# and the role waits for it to be healthy, its backbones up, before the
+# next one goes.
+- name: Gateways
+  hosts: gateways
+  become: true
+  serial: 1
+  roles: [gateway]
+
+- name: Clients
+  hosts: clients
+  become: true
+  serial: 1
+  roles: [client]

@@ -5,9 +5,11 @@ package main
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,20 +19,43 @@ import (
 	"github.com/ngthdong/egressa/internal/control"
 )
 
-func TestParseGateway(t *testing.T) {
+func TestParseConnect(t *testing.T) {
 	for in, want := range map[string]string{"-sg": "sg", "--sg": "sg", "sg": "sg", "-sing": "sing"} {
-		if got, err := parseGateway([]string{in}); err != nil || got != want {
-			t.Errorf("parseGateway(%q) = %q, %v", in, got, err)
+		if got, ip, err := parseConnect([]string{in}); err != nil || got != want || ip {
+			t.Errorf("parseConnect(%q) = %q, %v, %v", in, got, ip, err)
 		}
 	}
-	if got, err := parseGateway(nil); err != nil || got != "" {
-		t.Errorf("no argument: %q, %v", got, err)
+	if got, ip, err := parseConnect(nil); err != nil || got != "" || ip {
+		t.Errorf("no argument: %q, %v, %v", got, ip, err)
 	}
-	if _, err := parseGateway([]string{"--"}); err == nil {
+	for _, args := range [][]string{{"-sg", "--ipsec"}, {"--ipsec", "sg"}, {"-ipsec", "-sg"}} {
+		if got, ip, err := parseConnect(args); err != nil || got != "sg" || !ip {
+			t.Errorf("parseConnect(%q) = %q, %v, %v", args, got, ip, err)
+		}
+	}
+	if got, ip, err := parseConnect([]string{"--ipsec"}); err != nil || got != "" || !ip {
+		t.Errorf("--ipsec alone: %q, %v, %v", got, ip, err)
+	}
+	if _, _, err := parseConnect([]string{"--"}); err == nil {
 		t.Error("accepted --")
 	}
-	if _, err := parseGateway([]string{"-sg", "-sing"}); err == nil {
+	if _, _, err := parseConnect([]string{"-sg", "-sing"}); err == nil {
 		t.Error("accepted two gateways")
+	}
+}
+
+func TestCharonReady(t *testing.T) {
+	t.Setenv("EGRESSA_VICI_SOCKET", filepath.Join(t.TempDir(), "none.vici"))
+	if err := charonReady(); err == nil || !strings.Contains(err.Error(), "strongswan") {
+		t.Errorf("no socket: %v", err)
+	}
+	sock := filepath.Join(t.TempDir(), "charon.vici")
+	if err := os.WriteFile(sock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EGRESSA_VICI_SOCKET", sock)
+	if err := charonReady(); err != nil {
+		t.Errorf("with a socket: %v", err)
 	}
 }
 
@@ -73,7 +98,8 @@ func TestConf(t *testing.T) {
 	if _, err := readConf(path); !errors.Is(err, errNotJoined) {
 		t.Fatalf("missing conf: %v", err)
 	}
-	want := conf{Controller: "https://ctl", Token: "s3cr3t", Egress: "sg"}
+	want := conf{Controller: "https://ctl", Token: "s3cr3t", Egress: "sg", LogFormat: "json",
+		Bypass: []netip.Addr{netip.MustParseAddr("198.51.100.7")}}
 	if err := writeConf(path, want); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +108,7 @@ func TestConf(t *testing.T) {
 		t.Fatalf("conf mode %v, %v; it holds the token", fi.Mode(), err)
 	}
 	got, err := readConf(path)
-	if err != nil || got != want {
+	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("read %+v, %v", got, err)
 	}
 	if err := os.WriteFile(path, []byte(`{"controller":"https://ctl"}`), 0o600); err != nil {
@@ -145,7 +171,7 @@ func TestPrintGatewaysAndStatus(t *testing.T) {
 	}
 	printStatus(&buf, st)
 	out = strings.Join(strings.Fields(buf.String()), " ") // tabwriter pads with spaces
-	for _, want := range []string{"Connected since", "Leaving from: sg (gateway 103.153.255.243)", "Entering at: sing", "Path changes: 2", "* via sing 95.9 ms", "direct 82.4 ms"} {
+	for _, want := range []string{"Connected since", "Leaving from: sg (gateway 103.153.255.243)", "Entering at: sing", "Encryption: WireGuard", "Path changes: 2", "* via sing 95.9 ms", "direct 82.4 ms"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status lacks %q:\n%s", want, out)
 		}
@@ -153,11 +179,12 @@ func TestPrintGatewaysAndStatus(t *testing.T) {
 	if strings.Contains(out, "50.0 ms") {
 		t.Errorf("status shows a path to another egress:\n%s", out)
 	}
-	st.CurrentDead, st.ControllerUp = true, false
+	st.CurrentDead, st.ControllerUp, st.Backend = true, false, "ipsec"
 	buf.Reset()
 	printStatus(&buf, st)
-	if !strings.Contains(buf.String(), "not answering") || !strings.Contains(buf.String(), "controller unreachable") {
-		t.Errorf("degraded status:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "not answering") || !strings.Contains(buf.String(), "controller unreachable") ||
+		!strings.Contains(buf.String(), "IPsec to the entry gateway") {
+		t.Errorf("degraded IPsec status:\n%s", buf.String())
 	}
 }
 
@@ -180,3 +207,15 @@ func TestUnitFile(t *testing.T) {
 }
 
 func b64(s string) string { return base64RawURL(s) }
+
+func TestFlagGiven(t *testing.T) {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.String("log-format", "text", "")
+	fs.String("log-level", "info", "")
+	if err := fs.Parse([]string{"--log-level", "debug"}); err != nil {
+		t.Fatal(err)
+	}
+	if flagGiven(fs, "log-format") || !flagGiven(fs, "log-level") {
+		t.Error("flagGiven")
+	}
+}

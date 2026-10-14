@@ -1,0 +1,13 @@
+{
+  "controller": {{ egressa_controller_url | to_json }},
+  "token": {{ lookup('ansible.builtin.password', egressa_secrets_dir ~ '/client.token chars=hexdigits length=64') | to_json }},
+  "egress": {{ client_exit | to_json }},
+  "backend": {{ egressa_backend | to_json }},
+  "metrics_listen": {{ ('0.0.0.0:' ~ egressa_metrics_port) | to_json }},
+  "log_format": "json",
+  "bypass": [
+{% for ip in client_bypass %}
+    {{ ip | to_json }}{{ ',' if not loop.last else '' }}
+{% endfor %}
+  ]
+}

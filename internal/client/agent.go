@@ -52,9 +52,12 @@ type Config struct {
 	Egress string
 	// FullTunnel routes all of the host's traffic through the VPN.
 	FullTunnel bool
-	MTU        int
-	DeadAfter  time.Duration
-	Probe      pathmon.Config
+	// Bypass are hosts kept off the VPN in full tunnel mode, besides the
+	// controller and the gateways: an operator's SSH or Prometheus host.
+	Bypass    []netip.Addr
+	MTU       int
+	DeadAfter time.Duration
+	Probe     pathmon.Config
 	// Logger receives the agent's logs; nil means slog.Default().
 	Logger *slog.Logger
 	// Metrics, if set, receives the agent's metrics.
@@ -64,6 +67,11 @@ type Config struct {
 	// StatusFile, if set, is rewritten with the client's Status after
 	// every decision pass, and removed when the client stops.
 	StatusFile string
+	// Backend is the client's data plane to its access gateway:
+	// api.BackendWireGuard (the default) or api.BackendIPsec, which needs
+	// IPsec.
+	Backend string
+	IPsec   *IPsecConfig
 }
 
 // pendingMigration is a move the client has decided on and asked the
@@ -84,6 +92,7 @@ type Agent struct {
 	sessionID string
 	secret    string
 	dev       *tunnel.RealDevice
+	ip        *ipsecPlane // the IPsec data plane; nil with WireGuard
 	mon       *pathmon.Monitor
 	start     time.Time
 	// controllerUp is whether the last request to the controller got an
@@ -108,6 +117,12 @@ type Agent struct {
 func New(cfg Config) (*Agent, error) {
 	if cfg.Controller == nil || cfg.StateFile == "" || cfg.Interface == "" {
 		return nil, errors.New("client: a controller, a state file and an interface name are required")
+	}
+	if !api.ValidBackend(cfg.Backend) {
+		return nil, fmt.Errorf("client: unknown backend %q", cfg.Backend)
+	}
+	if cfg.Backend == api.BackendIPsec && cfg.IPsec == nil {
+		return nil, errors.New("client: the IPsec backend needs charon (IPsecConfig)")
 	}
 	if cfg.MTU == 0 {
 		cfg.MTU = DefaultMTU
@@ -145,7 +160,7 @@ func (a *Agent) open(ctx context.Context) error {
 	a.key = kp
 	for {
 		resp, err := a.cfg.Controller.CreateSession(ctx, api.CreateSessionRequest{
-			PublicKey: tunnel.Base64(kp.Public), Egress: a.cfg.Egress, Secret: st.Secret,
+			PublicKey: tunnel.Base64(kp.Public), Egress: a.cfg.Egress, Secret: st.Secret, Backend: a.cfg.Backend,
 		})
 		if err == nil {
 			st.SessionID, st.Secret = resp.Session.ID, resp.Secret
@@ -185,7 +200,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("client: session ID %q: %w", a.session.ID, err)
 	}
 	a.log.InfoContext(a.logCtx(), "session opened", "virtual_ip", a.session.VirtualIP.String(),
-		"access", a.session.Access, "egress", a.session.Egress, "epoch", a.session.Epoch)
+		"access", a.session.Access, "egress", a.session.Egress, "epoch", a.session.Epoch, "backend", a.session.Backend)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if a.cfg.Backend == api.BackendIPsec {
+		return a.runIPsec(ctx, runCtx, cancel, st)
+	}
 
 	dev, err := tunnel.NewReal(tunnel.RealConfig{
 		PrivateKey: a.key.Private, InterfaceName: a.cfg.Interface, MTU: a.cfg.MTU,
@@ -216,6 +237,9 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.addBypass(h)
 			}
 		}
+		for _, h := range a.cfg.Bypass {
+			a.addBypass(h)
+		}
 	}
 
 	probe, err := pathmon.ListenUDP(netip.AddrPortFrom(a.session.VirtualIP, 0))
@@ -236,8 +260,48 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.log.Info("full tunnel on: all traffic goes through the VPN", "interface", dev.Name())
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	return a.loop(ctx, runCtx, st)
+}
+
+// runIPsec is Run with the IPsec data plane.
+func (a *Agent) runIPsec(ctx, runCtx context.Context, cancel context.CancelFunc, st api.ClientState) error {
+	var controllers []netip.Addr
+	if host, err := netip.ParseAddr(a.cfg.Controller.Host()); err == nil {
+		controllers = append(controllers, host)
+	} else if addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", a.cfg.Controller.Host()); err == nil {
+		controllers = append(controllers, addrs...)
+	}
+	controllers = append(controllers, a.cfg.Bypass...)
+	var split []netip.Prefix
+	if !a.cfg.FullTunnel {
+		split = []netip.Prefix{a.network.NodeSubnet}
+	}
+	plane, err := newIPsecPlane(runCtx, *a.cfg.IPsec, a.session, a.cfg.FullTunnel, controllers, split, a.log)
+	if err != nil {
+		return err
+	}
+	a.ip = plane
+	defer func() { cancel(); plane.close() }()
+	// The virtual IP lives on the XFRM interfaces, which come up one by
+	// one, so probes are sent from an unbound socket: the per-gateway
+	// routes give them the virtual IP as source.
+	probe, err := pathmon.ListenUDP(netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
+	if err != nil {
+		return err
+	}
+	a.mon = pathmon.NewMonitor(probe, a.cfg.Probe)
+	a.start = time.Now()
+	a.since = a.start
+	a.decider = NewDecider(st.Policy, a.start)
+	a.update(st)
+	if a.cfg.FullTunnel {
+		a.log.Info("full tunnel on: all traffic goes through the VPN over IPsec")
+	}
+	return a.loop(ctx, runCtx, st)
+}
+
+// loop runs the probes, the state poll and the decisions until ctx ends.
+func (a *Agent) loop(ctx, runCtx context.Context, st api.ClientState) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	wg.Add(2)
@@ -336,11 +400,16 @@ func (a *Agent) update(st api.ClientState) {
 		a.decider = NewDecider(st.Policy, time.Now())
 	}
 	targets := make(map[string]netip.AddrPort)
+	var ipsecGWs []api.Gateway
 	for _, g := range st.Gateways {
-		if !g.Roles.Has(control.RoleAccess) {
+		if !a.usableAccess(g) {
 			continue
 		}
 		targets[g.ID] = netip.AddrPortFrom(g.NodeIP, st.Network.ProbePort)
+		if a.ip != nil {
+			ipsecGWs = append(ipsecGWs, g)
+			continue
+		}
 		if old, ok := a.peers[g.ID]; ok && old.PublicKey == g.PublicKey && old.Endpoint == g.Endpoint && old.NodeIP == g.NodeIP {
 			continue
 		}
@@ -354,11 +423,20 @@ func (a *Agent) update(st api.ClientState) {
 		a.peers[g.ID] = g
 	}
 	a.mu.Unlock()
+	if a.ip != nil {
+		a.ip.sync(ipsecGWs)
+	}
 	if err := a.mon.Set(targets); err != nil {
 		a.log.Warn("set probe targets failed", telemetry.Err(err))
 	}
 	// Someone else moved the session (or a migration's answer was lost).
 	a.adopt(st.Session)
+}
+
+// usableAccess reports whether the client can enter through gateway g:
+// it is an access gateway, and takes IPsec clients if this one is.
+func (a *Agent) usableAccess(g api.Gateway) bool {
+	return g.Roles.Has(control.RoleAccess) && (a.cfg.Backend != api.BackendIPsec || g.IPsec)
 }
 
 // configurePeerLocked sets gateway g as a peer. The peer always carries
@@ -390,9 +468,18 @@ func (a *Agent) adopt(sess api.Session) {
 		slog.String("access", sess.Access), slog.String("egress", sess.Egress),
 		slog.String("from_access", old.Access), slog.String("from_egress", old.Egress))
 	var switchErr error
-	// The epoch first: the new access may already fence older epochs.
-	a.dev.SetEpoch(uint32(sess.Epoch))
-	if sess.Access != old.Access {
+	if a.ip != nil {
+		// No session header on ESP: the epoch only names the next SAs.
+		if sess.Access != old.Access {
+			if switchErr = a.ip.activate(sess.Access, sess.Epoch); switchErr != nil {
+				a.log.Warn("switching the IPsec access gateway failed", "access", sess.Access, telemetry.Err(switchErr))
+			}
+		}
+	} else {
+		// The epoch first: the new access may already fence older epochs.
+		a.dev.SetEpoch(uint32(sess.Epoch))
+	}
+	if a.ip == nil && sess.Access != old.Access {
 		g, ok := api.FindGateway(a.gateways, sess.Access)
 		if !ok {
 			switchErr = fmt.Errorf("new access gateway %s is unknown", sess.Access)
@@ -432,7 +519,7 @@ func (a *Agent) paths(now time.Time) (paths []Path, currentDead bool) {
 	defer a.mu.Unlock()
 	halfLife := float64(measurement.DefaultSegmentTrackerConfig.StalenessHalfLife)
 	for _, acc := range a.gateways {
-		if !acc.Roles.Has(control.RoleAccess) {
+		if !a.usableAccess(acc) {
 			continue
 		}
 		stats, lastReply, ok := a.mon.Stats(acc.ID)

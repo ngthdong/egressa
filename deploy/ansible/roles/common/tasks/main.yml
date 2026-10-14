@@ -1,0 +1,52 @@
+---
+- name: Install the packages every host needs
+  ansible.builtin.apt:
+    name: [chrony, iproute2, iptables, ufw, curl]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Run chrony (scenarios start on every host at the same second)
+  ansible.builtin.systemd_service:
+    name: chrony
+    state: started
+    enabled: true
+
+- name: Wait for the clock to synchronise
+  ansible.builtin.command: chronyc waitsync 12 0.05
+  changed_when: false
+  register: common_waitsync
+  failed_when: false
+
+- name: Fail on an unsynchronised clock
+  ansible.builtin.fail:
+    msg: >-
+      chrony has not synchronised the clock to within 50 ms after 2 minutes.
+      Check `chronyc sources -v` and that UDP 123 outbound is open; netem
+      scenarios need every host to agree on the start time.
+  when: common_waitsync.rc != 0
+
+- name: Create egressa's directories, root only (they hold secrets and keys)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop: [/etc/egressa, /var/lib/egressa]
+
+- name: Install vpnctl (netem scenarios, migration traces)
+  ansible.builtin.copy:
+    src: "{{ egressa_dist_dir }}/linux-{{ egressa_arch }}/vpnctl"
+    dest: /usr/local/bin/vpnctl
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the netem scenarios
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scenarios/"
+    dest: /etc/egressa/scenarios/
+    owner: root
+    group: root
+    mode: "0644"

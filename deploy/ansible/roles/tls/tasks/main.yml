@@ -1,0 +1,16 @@
+---
+# The private CA and the controller's certificate, kept on the machine
+# running Ansible. Generated once; issued again only when the controller's
+# address changes or a certificate is within 30 days of expiring.
+- name: Keep a private CA and the controller's certificate in .secrets/tls
+  ansible.builtin.command:
+    argv:
+      - "{{ role_path }}/files/gen-tls.sh"
+      - "{{ egressa_secrets_dir }}/tls"
+      - "{{ egressa_controller_url | urlsplit('hostname') }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: tls_gen
+  changed_when: tls_gen.stdout == 'changed'
+  when: egressa_tls_private_ca | bool

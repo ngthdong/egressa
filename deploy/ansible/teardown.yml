@@ -1,0 +1,62 @@
+---
+# Takes the testbed down: make testbed-down. It stops and removes egressa
+# from every host and clears any netem shaping; packages, ufw rules and
+# the generated secrets (deploy/ansible/.secrets) stay.
+- name: Clients
+  hosts: clients
+  become: true
+  tasks:
+    - name: Disconnect (restores the host's routing)
+      ansible.builtin.command: /usr/local/bin/egressa disconnect
+      register: egressa_disconnect
+      changed_when: egressa_disconnect.rc == 0
+      failed_when: false
+
+    - name: Stop the client's service
+      ansible.builtin.systemd_service:
+        name: egressa
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove the client
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: [/etc/systemd/system/egressa.service, /usr/local/bin/egressa, /etc/egressa/client.conf, /var/lib/egressa/client.json]
+
+- name: Gateways and controller
+  hosts: gateways:controller
+  become: true
+  tasks:
+    - name: Stop the services (gateways remove their interfaces, rules and NAT)
+      ansible.builtin.systemd_service:
+        name: "{{ 'egressa-gateway' if inventory_hostname in groups['gateways'] else 'egressa-controller' }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove the units, binaries and state
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/egressa-gateway.service
+        - /etc/systemd/system/egressa-controller.service
+        - /usr/local/bin/egressa-gateway
+        - /usr/local/bin/egressa-controller
+        - /var/lib/egressa/controller.json
+
+- name: Every host
+  hosts: all
+  become: true
+  tasks:
+    - name: Clear netem shaping
+      ansible.builtin.command: /usr/local/bin/vpnctl netem clear --dev {{ ansible_default_ipv4.interface }}
+      register: egressa_clear
+      changed_when: egressa_clear.rc == 0
+      failed_when: false
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true

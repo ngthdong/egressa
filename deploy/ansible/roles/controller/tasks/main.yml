@@ -1,0 +1,98 @@
+---
+- name: Install the controller
+  ansible.builtin.copy:
+    src: "{{ egressa_dist_dir }}/linux-{{ egressa_arch }}/controller"
+    dest: /usr/local/bin/egressa-controller
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart controller
+
+- name: Install the secrets
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.password', egressa_secrets_dir ~ '/' ~ item ~ ' chars=hexdigits length=64') }}\n"
+    dest: /etc/egressa/{{ item }}
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ ['gateway.token', 'client.token'] + (['ipsec.key'] if egressa_backend == 'ipsec' else []) }}"
+  no_log: true
+  notify: Restart controller
+
+- name: Install the API's certificate and key
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: /etc/egressa/{{ item.dest }}
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - {src: "{{ egressa_tls_cert_file or egressa_secrets_dir ~ '/tls/controller.crt' }}", dest: controller.crt}
+    - {src: "{{ egressa_tls_key_file or egressa_secrets_dir ~ '/tls/controller.key' }}", dest: controller.key}
+  loop_control:
+    label: "{{ item.dest }}"
+  when: egressa_tls | bool
+  notify: Restart controller
+
+- name: Install the private CA (to check the API below)
+  ansible.builtin.copy:
+    src: "{{ egressa_secrets_dir }}/tls/ca.crt"
+    dest: /etc/egressa/ca.crt
+    owner: root
+    group: root
+    mode: "0644"
+  when: egressa_tls_private_ca | bool
+
+- name: Install the policy
+  ansible.builtin.copy:
+    content: "{{ egressa_policy | to_nice_json }}\n"
+    dest: /etc/egressa/policy.json
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart controller
+
+- name: Install the unit
+  ansible.builtin.template:
+    src: egressa-controller.service.j2
+    dest: /etc/systemd/system/egressa-controller.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart controller
+
+- name: Start the controller
+  ansible.builtin.systemd_service:
+    name: egressa-controller
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Apply a changed binary, secret or policy now
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the controller to answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ egressa_controller_port }}/healthz"
+  register: controller_health
+  until: controller_health.status == 200
+  retries: 15
+  delay: 2
+  when: not egressa_tls | bool
+
+# At the URL gateways and clients use, so the name in the certificate is
+# checked too, but connecting to this host: curl --connect-to.
+- name: Wait for the controller to answer over HTTPS, checked like a gateway checks it
+  ansible.builtin.command:  # noqa: command-instead-of-module (uri has no --connect-to)
+    argv: >-
+      {{ ['curl', '-fsS', '--max-time', '3',
+          '--connect-to', (egressa_controller_url | urlsplit('hostname')) ~ ':' ~ (egressa_controller_url | urlsplit('port'))
+                          ~ ':127.0.0.1:' ~ egressa_controller_port]
+         + (['--cacert', '/etc/egressa/ca.crt'] if egressa_tls_private_ca | bool else [])
+         + [egressa_controller_url ~ '/healthz'] }}
+  register: controller_health
+  until: controller_health.rc == 0 and controller_health.stdout == 'ok'
+  retries: 15
+  delay: 2
+  changed_when: false
+  when: egressa_tls | bool

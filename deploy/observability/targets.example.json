@@ -1,0 +1,5 @@
+[
+  {"targets": ["192.0.2.10:9101"], "labels": {"job": "egressa-controller", "node": "controller", "testbed": "example"}},
+  {"targets": ["192.0.2.11:9101"], "labels": {"job": "egressa-gateway", "node": "gw1", "testbed": "example"}},
+  {"targets": ["192.0.2.20:9101"], "labels": {"job": "egressa-client", "node": "client", "testbed": "example"}}
+]

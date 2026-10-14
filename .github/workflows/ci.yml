@@ -15,10 +15,11 @@ concurrency:
 
 env:
   GO_VERSION: "1.26.4"
-  STRICT_PACKAGES: "./pkg/... ./internal/buildinfo/... ./internal/measurement/... ./internal/control/... ./internal/handoff/... ./internal/reorder/... ./internal/ipsec/... ./internal/telemetry/..."
+  STRICT_PACKAGES: "./pkg/... ./internal/buildinfo/... ./internal/measurement/... ./internal/control/... ./internal/handoff/... ./internal/reorder/... ./internal/ipsec/... ./internal/telemetry/... ./internal/netem/..."
   STRICT_THRESHOLD: "90"
   TUNNEL_PACKAGES: "./internal/tunnel/..."
   TUNNEL_THRESHOLD: "75"
+  PROMETHEUS_VERSION: "3.5.0"
 
 jobs:
   quality:
@@ -156,19 +157,45 @@ jobs:
           fi
           sudo modprobe veth
           sudo modprobe bridge
+          # IPsec from a client to its entry gateway (TestIPsecAccess and
+          # the testbed's IPsec run).
+          sudo modprobe xfrm_interface
+          sudo modprobe esp4
 
-      - name: Run the end-to-end test (real binaries, migrations under netem)
-        # Controller, two gateways, a client and an Internet server, each
-        # in its own network namespace. A skip is a failure here.
+      - name: Install Prometheus and promtool (the testbed smoke test scrapes with them)
+        run: |
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "EGRESSA_PROMETHEUS=$RUNNER_TEMP/prometheus-${PROMETHEUS_VERSION}.linux-amd64/prometheus" >> "$GITHUB_ENV"
+          echo "EGRESSA_PROMTOOL=$RUNNER_TEMP/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" >> "$GITHUB_ENV"
+
+      - name: Run the end-to-end tests (real binaries in network namespaces)
         run: |
           set -o pipefail
-          sudo env "PATH=$PATH" go test -count=1 -v -run TestManagedMigration ./internal/e2e/ | tee e2e.log
-          if grep -q -- '--- SKIP' e2e.log; then
-            echo "::error::the end-to-end test was skipped:"
-            grep -- 'skipping' e2e.log
+          sudo env "PATH=$PATH" EGRESSA_PROMETHEUS="$EGRESSA_PROMETHEUS" EGRESSA_PROMTOOL="$EGRESSA_PROMTOOL" \
+            go test -count=1 -v -run 'TestManagedMigration|TestIPsecAccess|TestLocalTestbed|TestLocalTestbedFirewall' ./internal/e2e/ | tee e2e.log
+          if grep -q -- '--- SKIP' e2e.log || grep -q 'no prometheus\|no promtool' e2e.log; then
+            echo "::error::an end-to-end test or check was skipped:"
+            grep -- 'skipping\|no prometheus\|no promtool' e2e.log
             exit 1
           fi
-          grep -q -- '--- PASS: TestManagedMigration' e2e.log
+          for t in TestManagedMigration TestIPsecAccess TestLocalTestbed TestLocalTestbedFirewall; do
+            grep -q -- "^--- PASS: $t " e2e.log || { echo "::error::$t did not pass"; exit 1; }
+          done
+
+      - name: Run the local testbed over IPsec, also behind the firewall
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" EGRESSA_TESTBED_BACKEND=ipsec \
+            go test -count=1 -v -run '^TestLocalTestbed(Firewall)?$' ./internal/e2e/ | tee testbed-ipsec.log
+          if grep -q -- '--- SKIP' testbed-ipsec.log; then
+            echo "::error::a testbed test over IPsec was skipped"
+            exit 1
+          fi
+          grep -q 'client on ipsec' testbed-ipsec.log
+          grep -q 'behind a firewall, client on ipsec' testbed-ipsec.log
+          grep -q -- '^--- PASS: TestLocalTestbed ' testbed-ipsec.log
+          grep -q -- '^--- PASS: TestLocalTestbedFirewall ' testbed-ipsec.log
 
       - name: Upload coverage reports
         if: always()
@@ -180,13 +207,46 @@ jobs:
             coverage-tunnel.out
             ipsec-e2e.log
             e2e.log
+            testbed-ipsec.log
           if-no-files-found: error
+
+  deploy:
+    name: Deploy configuration checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Ansible, ansible-lint and the collections
+        run: |
+          pipx install --include-deps ansible-core
+          pipx inject ansible-core ansible-lint --include-apps
+          ansible-galaxy collection install -r deploy/ansible/requirements.yml
+
+      - name: Static checks of deploy/
+        run: make deploy-check
+
+      - name: Terraform
+        run: |
+          if ls deploy/terraform/*.tf >/dev/null 2>&1; then
+            echo "::error::deploy/terraform has .tf files: add terraform fmt -check and validate here"
+            exit 1
+          fi
 
   build:
     name: Build binaries
     needs:
       - quality
       - tests
+      - deploy
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -202,6 +262,16 @@ jobs:
 
       - name: Build all cmd/ binaries
         run: make build
+
+      - name: Cross-compile the testbed's Linux binaries, reproducibly
+        # The same commit must build the same binaries, or every
+        # make testbed-up restarts every service.
+        run: |
+          make cross
+          sha256sum dist/linux-*/* > first.sha256
+          make cross
+          sha256sum -c first.sha256
+          dist/linux-amd64/gateway --version | grep -q "commit $(git rev-parse --short HEAD)"
 
       - name: Cross-compile sanity check
         run: |

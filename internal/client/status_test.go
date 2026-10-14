@@ -14,7 +14,7 @@ import (
 
 func TestStatus_WriteReadLive(t *testing.T) {
 	sess := api.Session{ID: "42", VirtualIP: netip.MustParseAddr("10.201.0.2"), Access: "sing", Egress: "sg", Epoch: 3}
-	gws := []api.Gateway{{ID: "sg", Endpoint: "103.153.255.243:51820"}, {ID: "sing", Endpoint: "38.47.176.90:51820"}}
+	gws := []api.Gateway{{ID: "sg", Endpoint: "203.0.113.11:51820"}, {ID: "sing", Endpoint: "203.0.113.12:51820"}}
 	ps := []Path{
 		{Access: "sg", Egress: "sg", Segments: []measurement.SegmentStats{seg(5)}, Reachable: true},
 		{Access: "sing", Egress: "sg", Segments: []measurement.SegmentStats{seg(48), seg(45)}, Reachable: true},
@@ -32,7 +32,7 @@ func TestStatus_WriteReadLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Egress != "sg" || got.EgressIP != "103.153.255.243" || got.Epoch != 3 || got.PID != os.Getpid() || !got.ControllerUp {
+	if got.Egress != "sg" || got.EgressIP != "203.0.113.11" || got.Epoch != 3 || got.PID != os.Getpid() || !got.ControllerUp {
 		t.Fatalf("status %+v", got)
 	}
 	if len(got.Paths) != 3 || got.Paths[0].CostMS != 82 || !got.Paths[0].Usable || got.Paths[0].Active ||

@@ -86,7 +86,8 @@ tokens and the gateways' public keys cross it.
 
 ## Variables
 
-See `group_vars/all.yml`: `egressa_backend` (`wireguard` or `ipsec`),
+See `roles/egressa/defaults/main.yml` (override any of them in
+`inventory.ini` or with `-e`): `egressa_backend` (`wireguard` or `ipsec`),
 `egressa_tls*`, ports, the overlay (`egressa_client_subnet`,
 `egressa_node_subnet`, `egressa_probe_port`, passed to the controller
 explicitly), `egressa_policy` (short flap-guard timers so a scenario's

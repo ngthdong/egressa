@@ -4,6 +4,7 @@
   hosts: all
   become: true
   gather_facts: false
+  roles: [egressa]
   tasks:
     - name: Ask each process for /healthz
       ansible.builtin.uri:

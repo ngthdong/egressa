@@ -1,5 +1,9 @@
 ---
-# Defaults for every host; override in inventory.ini or with -e.
+# Defaults for every host. They are role defaults, the lowest precedence
+# Ansible has, so [all:vars], a group's or a host's line in inventory.ini,
+# or -e on the command line override them. (In group_vars/all.yml next
+# to the playbooks they would override the inventory instead.) Every play
+# lists this role first.
 
 # Data plane from clients to their entry (access) gateway: wireguard or
 # ipsec. Between gateways it is always WireGuard.

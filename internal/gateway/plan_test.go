@@ -113,6 +113,10 @@ func TestWithOp(t *testing.T) {
 	if r[2] != "%s" {
 		t.Error("withOp changed its input")
 	}
+	probe := withOp(probeInputRule("egb+", netip.MustParseAddr("10.200.0.1"), 51900), "-I")
+	if want := []string{"-I", "INPUT", "-i", "egb+", "-p", "udp", "-d", "10.200.0.1/32", "--dport", "51900", "-j", "ACCEPT"}; !reflect.DeepEqual(probe, want) {
+		t.Errorf("probeInputRule %v", probe)
+	}
 	if got := ruleFrom(vip1, 1003); !reflect.DeepEqual(got, []string{"from", "10.201.0.2/32", "lookup", "1003", "pref", "1000"}) {
 		t.Errorf("ruleFrom %v", got)
 	}

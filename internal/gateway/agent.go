@@ -394,6 +394,20 @@ func (a *Agent) setup() error {
 		}
 	}
 
+	// Probes come in through the tunnels: from clients over egc0 (or
+	// egi0 for IPsec clients), from other gateways over egb<n>.
+	probeDevs := []string{clientDevice, "egb+"}
+	if a.cfg.IPsec != nil && a.cfg.Roles.Has(control.RoleAccess) {
+		probeDevs = append(probeDevs, ipsecDevice)
+	}
+	for _, dev := range probeDevs {
+		r := probeInputRule(dev, a.nodeIP, a.network.ProbePort)
+		if err := ensureIptables(r); err != nil {
+			return err
+		}
+		a.undo = append(a.undo, func() { _ = deleteIptables(r) })
+	}
+
 	echo, err := pathmon.ListenUDP(netip.AddrPortFrom(a.nodeIP, a.network.ProbePort))
 	if err != nil {
 		return err

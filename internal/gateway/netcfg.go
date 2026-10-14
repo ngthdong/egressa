@@ -96,6 +96,15 @@ func forwardRules(dev string) [][]string {
 	}
 }
 
+// probeInputRule accepts the probes that reach this gateway's echo
+// responder (udp to nodeIP:port) through dev, and nothing else: a host
+// firewall with a default-deny INPUT policy (ufw) would otherwise drop
+// every probe and leave the paths unmeasured.
+func probeInputRule(dev string, nodeIP netip.Addr, port uint16) []string {
+	return []string{"%s", "INPUT", "-i", dev, "-p", "udp", "-d", netip.PrefixFrom(nodeIP, 32).String(),
+		"--dport", strconv.Itoa(int(port)), "-j", "ACCEPT"}
+}
+
 func withOp(rule []string, op string) []string {
 	out := slices.Clone(rule)
 	for i, a := range out {

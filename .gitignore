@@ -8,3 +8,5 @@ coverage.*
 .DS_Store
 .vscode/
 .idea/  
+# The local testbed's run state, logs and generated secrets
+deploy/local/.run/

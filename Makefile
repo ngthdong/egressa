@@ -103,6 +103,30 @@ observability-up: ## Start Prometheus and Grafana on 127.0.0.1 (needs GRAFANA_AD
 observability-down: ## Stop Prometheus and Grafana (data volumes stay)
 	$(COMPOSE) down
 
+# Local testbed (deploy/local): network namespaces on this machine
+
+SUDO     ?= $(shell [ "$$(id -u)" -eq 0 ] || echo sudo)
+GATEWAYS ?= 2
+BACKEND  ?= auto
+FIREWALL ?= 0
+TESTBED_LOCAL = $(SUDO) env BIN_DIR=$(CURDIR)/$(BIN_DIR) GATEWAYS=$(GATEWAYS) BACKEND=$(BACKEND) FIREWALL=$(FIREWALL) deploy/local/testbed.sh
+
+.PHONY: testbed-local-up
+testbed-local-up: build ## Bring the local testbed up (root via sudo; GATEWAYS=2|3, BACKEND=auto|wireguard|ipsec, FIREWALL=1)
+	$(TESTBED_LOCAL) up
+
+.PHONY: testbed-local-down
+testbed-local-down: ## Take the local testbed down, also after a failed up
+	$(TESTBED_LOCAL) down
+
+.PHONY: testbed-local-status
+testbed-local-status: ## Show the local testbed's processes and health
+	$(TESTBED_LOCAL) status
+
+.PHONY: testbed-local-smoke
+testbed-local-smoke: ## Smoke-test the local testbed, also behind the VPS firewall (root, or user namespaces)
+	$(GO) test -count=1 -run '^TestLocalTestbed(Firewall)?$$' -v ./internal/e2e/
+
 .PHONY: help
 help:
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN{FS=":.*## "}{printf "  %-14s %s\n", $$1, $$2}'

@@ -90,6 +90,19 @@ run-controller: build
 clean: ## Remove build artifacts
 	rm -rf $(BIN_DIR)
 
+# --- Observability (deploy/observability) -----------------------------------
+
+COMPOSE = docker compose -f deploy/observability/docker-compose.yml
+
+.PHONY: observability-up
+observability-up: ## Start Prometheus and Grafana on 127.0.0.1 (needs GRAFANA_ADMIN_PASSWORD; GRAFANA_PORT=3300)
+	$(COMPOSE) up -d
+	@echo "Grafana: http://127.0.0.1:$${GRAFANA_PORT:-3300} (admin)   Prometheus: http://127.0.0.1:9090"
+
+.PHONY: observability-down
+observability-down: ## Stop Prometheus and Grafana (data volumes stay)
+	$(COMPOSE) down
+
 .PHONY: help
 help:
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN{FS=":.*## "}{printf "  %-14s %s\n", $$1, $$2}'

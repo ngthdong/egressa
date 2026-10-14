@@ -128,8 +128,8 @@ func TestConf(t *testing.T) {
 var testGateways = []api.Gateway{
 	{ID: "eu", Roles: control.RoleEgress, Endpoint: "192.0.2.13:51820", Alive: true},
 	{ID: "relay", Roles: control.RoleAccess, Endpoint: "192.0.2.14:51820", Alive: true},
-	{ID: "sg", Roles: control.RoleAccess | control.RoleEgress, Endpoint: "103.153.255.243:51820", Alive: true},
-	{ID: "sing", Roles: control.RoleAccess | control.RoleEgress, Endpoint: "38.47.176.90:51820", Alive: false},
+	{ID: "sg", Roles: control.RoleAccess | control.RoleEgress, Endpoint: "203.0.113.11:51820", Alive: true},
+	{ID: "sing", Roles: control.RoleAccess | control.RoleEgress, Endpoint: "203.0.113.12:51820", Alive: false},
 }
 
 func TestCheckEgressAndChooseAccess(t *testing.T) {
@@ -153,7 +153,7 @@ func TestPrintGatewaysAndStatus(t *testing.T) {
 	var buf bytes.Buffer
 	printGateways(&buf, testGateways)
 	out := buf.String()
-	for _, want := range []string{"egressa connect -sg", "DOWN", "103.153.255.243", "relay"} {
+	for _, want := range []string{"egressa connect -sg", "DOWN", "203.0.113.11", "relay"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("gateway list lacks %q:\n%s", want, out)
 		}
@@ -162,7 +162,7 @@ func TestPrintGatewaysAndStatus(t *testing.T) {
 	buf.Reset()
 	st := client.Status{
 		Started: time.Now(), Updated: time.Now(), SessionID: "42", VirtualIP: netip.MustParseAddr("10.201.0.2").String(),
-		Access: "sing", Egress: "sg", EgressIP: "103.153.255.243", Epoch: 3, ControllerUp: true,
+		Access: "sing", Egress: "sg", EgressIP: "203.0.113.11", Epoch: 3, ControllerUp: true,
 		Paths: []client.StatusPath{
 			{Access: "sg", Egress: "sg", CostMS: 82.4, Usable: true, Reachable: true},
 			{Access: "sing", Egress: "sg", CostMS: 95.9, Usable: true, Reachable: true, Active: true},
@@ -171,7 +171,7 @@ func TestPrintGatewaysAndStatus(t *testing.T) {
 	}
 	printStatus(&buf, st)
 	out = strings.Join(strings.Fields(buf.String()), " ") // tabwriter pads with spaces
-	for _, want := range []string{"Connected since", "Leaving from: sg (gateway 103.153.255.243)", "Entering at: sing", "Encryption: WireGuard", "Path changes: 2", "* via sing 95.9 ms", "direct 82.4 ms"} {
+	for _, want := range []string{"Connected since", "Leaving from: sg (gateway 203.0.113.11)", "Entering at: sing", "Encryption: WireGuard", "Path changes: 2", "* via sing 95.9 ms", "direct 82.4 ms"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status lacks %q:\n%s", want, out)
 		}
